@@ -10,7 +10,8 @@ per attention layer the keys, then the values, of every KV head, 32 tokens x
 For every (layer, tensor, KV head, dimension) the base of the 8- and the
 16-binade exponent window that covers the most elements is written to
 runtime/model/kvzip/<family>.inc, which runtime/model/KvZipBases.cpp
-compiles in. It also reports what ZBF16 pages of these bases would hold.
+compiles in (ZBF16 codes against the 16-binade window). It also reports how
+many escapes ZBF16 slabs of these bases need.
 
     .venv/bin/python -m dev.tools.kvzip_calibrate --family Qwen3.8-27B \\
         --layers 16 --kv-heads 4 DIR/<namespace>/kv.slots
@@ -23,9 +24,8 @@ import re
 
 import numpy as np
 
-TOKENS, DIMENSIONS, GROUP = 32, 256, 8
-SLOT_BYTES = 320  # a slab's overflow slot (runtime/metal/abi/KvZip.h)
-SHARE_BYTES = 128  # a slab's share of its page's spill pool
+TOKENS, DIMENSIONS = 32, 256
+ESCAPES = 256  # a slab's escape table (runtime/metal/abi/KvZip.h)
 REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
 
 
@@ -57,15 +57,10 @@ def windows(exponents: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return base3.astype(np.uint8), base4.astype(np.uint8)
 
 
-def slab_overflow(exponents: np.ndarray, base3: np.ndarray, base4: np.ndarray) -> np.ndarray:
-    """exponents [slabs, 32, 256] -> overflow bytes per slab under the bases."""
-    d3 = exponents.astype(np.int16) - base3.astype(np.int16)
-    d4 = exponents.astype(np.int16) - base4.astype(np.int16)
-    groups = exponents.shape[:-1] + (DIMENSIONS // GROUP, GROUP)
-    in3 = ((d3 >= 0) & (d3 < 8)).reshape(groups).all(-1)
-    in4 = ((d4 >= 0) & (d4 < 16)).reshape(groups).all(-1)
-    cost = np.where(in3, 0, np.where(in4, 1, 5))
-    return cost.reshape(exponents.shape[0], -1).sum(1)
+def slab_escapes(exponents: np.ndarray, base4: np.ndarray) -> np.ndarray:
+    """exponents [slabs, 32, 256] -> elements per slab outside the 16-binade window."""
+    delta = exponents.astype(np.int16) - base4.astype(np.int16)
+    return ((delta < 0) | (delta >= 16)).reshape(exponents.shape[0], -1).sum(1)
 
 
 def main() -> None:
@@ -81,10 +76,9 @@ def main() -> None:
     pages = sum(view.shape[0] for view in views)
     print(f"{pages} pages ({pages * TOKENS} tokens) from {len(views)} file(s)")
     bases = np.zeros((args.layers, 2, args.kv_heads, 2, DIMENSIONS), np.uint8)
-    worst = 0
-    # Per page, the overflow its slabs' slots do not hold, which the page's
-    # spill pool must (an upper bound: whole rows spill).
-    spilled = np.zeros(pages, np.int64)
+    # Per slab, the elements outside their dimension's 16-binade window,
+    # which the slab's escape table must hold.
+    escapes = []
     for layer in range(args.layers):
         for tensor in range(2):
             for head in range(args.kv_heads):
@@ -93,14 +87,10 @@ def main() -> None:
                     for view in views]).astype(np.uint8)
                 base3, base4 = windows(exponents.reshape(-1, DIMENSIONS))
                 bases[layer, tensor, head] = base3, base4
-                overflow = slab_overflow(exponents, base3, base4)
-                worst = max(worst, int(overflow.max()))
-                spilled += np.maximum(overflow - SLOT_BYTES, 0)
-    capacity = args.layers * 2 * args.kv_heads * SHARE_BYTES - 4
-    print(f"largest slab overflow {worst} bytes ({SLOT_BYTES}-byte slots); pages that spill: "
-          f"{int((spilled > 0).sum())}, largest spill {int(spilled.max())} of {capacity} bytes")
-    if spilled.max() > capacity:
-        print(f"  {int((spilled > capacity).sum())} pages would exhaust their spill pool")
+                escapes.append(slab_escapes(exponents, base4))
+    escapes = np.concatenate(escapes)
+    print(f"escapes per slab: mean {escapes.mean():.2f}, 99.9th percentile {np.percentile(escapes, 99.9):.0f}, "
+          f"largest {int(escapes.max())} of {ESCAPES}; slabs over the table: {int((escapes > ESCAPES).sum())}")
 
     slug = re.sub(r"[^0-9A-Za-z]+", "_", args.family).strip("_").lower()
     output = args.output or REPOSITORY / "runtime" / "model" / "kvzip" / f"{slug}.inc"

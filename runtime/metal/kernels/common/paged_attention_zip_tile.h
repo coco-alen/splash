@@ -7,26 +7,25 @@
 // The paged attention tile over ZBF16 pages. It runs the BF16 tile's page
 // loop (splash_paged_attention_tile) with the same MPP products, softmax and
 // partials; each page's keys, then its values, are first decoded into one
-// BF16 threadgroup tile of the layout the BF16 loop reads from device
-// memory, so a ZBF16 page attends exactly as the BF16 page it decodes to.
-// The page's scores share the tile: they are written after the keys' last
-// read and read before the values' first write. Threadgroup scratch beyond
-// the BF16 loop's probabilities and statistics: the 16 KiB tile, the slot's
-// 320 bytes and 8 words.
+// BF16 threadgroup tile, token-major, so a ZBF16 page attends exactly as the
+// BF16 page it decodes to (PV reads the values untransposed, bit for bit as
+// the BF16 loop's transposed read). The page's scores share the tile: they
+// are written after the keys' last read and read before the values' first
+// write. Threadgroup scratch beyond the BF16 loop's probabilities and
+// statistics: the 16 KiB tile.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile>
 inline void splash_paged_attention_zip_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, device const uchar *codec, uint kv_head, uint committed_tokens,
     uint active_rows, uint splits, uint split, device float *partials,
-    device float *statistics, ulong slot, threadgroup bfloat *probabilities, threadgroup float *row_max,
-    threadgroup float *row_sum, threadgroup float *previous_scale,
-    threadgroup atomic_uint *rescale, threadgroup bfloat *kv_tile,
-    threadgroup uint *partial, threadgroup uint *slot_words, uint thread_index,
-    uint simd_lane, uint simd_group) {
-  threadgroup float *scores = reinterpret_cast<threadgroup float *>(kv_tile);
+    device float *statistics, ulong slot, threadgroup bfloat *probabilities,
+    threadgroup float *row_max, threadgroup float *row_sum, threadgroup float *previous_scale,
+    threadgroup atomic_uint *rescale, threadgroup bfloat *kv_tile, uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashKvPageTokens;
   constexpr ushort D = SplashKvHeadDimension;
+  threadgroup float *scores = reinterpret_cast<threadgroup float *>(kv_tile);
+  threadgroup ushort *bits = reinterpret_cast<threadgroup ushort *>(kv_tile);
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
   uint per_split = splash_attention_pages_per_split(pages, splits);
@@ -44,7 +43,6 @@ inline void splash_paged_attention_zip_tile(
   auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto kt = tensor(kv_tile, dextents<int, 2>{D, N}, array<int, 2>{1, D});
-  // Values token-major ([token][dimension]), as keys: P (M x N) times V (N x D).
   auto vt = tensor(kv_tile, dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto p0 = pt.slice<N, M>(0, 0);
   auto q0 = qt.slice<D, M>(0, 0);
@@ -79,12 +77,10 @@ inline void splash_paged_attention_zip_tile(
     // Rows past the visible tokens hold stale bytes: they decode to zeros,
     // which the softmax masks as the BF16 loop masks its stale rows.
     const uint rows = min(uint(N), visible_tokens - token_start);
-    const SplashKvZipSpill<KVHeads> spill = addressing.spill(entry, codec);
-    splash_kvzip_decode_slab<KVHeads>(
-        splash_kvzip_load(addressing.slab(entry, kv_head, false), rows, thread_index), spill,
-        key_bases, false, reinterpret_cast<threadgroup ushort *>(kv_tile), partial, slot_words,
-        thread_index, simd_lane, simd_group);
-
+    const SplashKvZipSlab keys = addressing.slab(entry, kv_head, false);
+    const SplashKvZipSlab values = addressing.slab(entry, kv_head, true);
+    splash_kvzip_decode_slab(splash_kvzip_load(keys, rows, thread_index), keys, key_bases, false,
+                             bits, thread_index);
     auto page_scores = qk.template get_destination_cooperative_tensor<
         decltype(q0), decltype(k0), float>();
     qk.run(q0, k0, page_scores);
@@ -98,10 +94,10 @@ inline void splash_paged_attention_zip_tile(
         scores, probabilities, row_max, row_sum, previous_scale, rescale, nullptr,
         nullptr, token_start, visible_tokens, committed_tokens, active_rows,
         thread_index);
-    splash_kvzip_decode_slab<KVHeads>(
-        splash_kvzip_load(addressing.slab(entry, kv_head, true), rows, thread_index), spill,
-        value_bases, false, reinterpret_cast<threadgroup ushort *>(kv_tile), partial, slot_words,
-        thread_index, simd_lane, simd_group);
+    // The scores are read before the values overwrite them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    splash_kvzip_decode_slab(splash_kvzip_load(values, rows, thread_index), values, value_bases,
+                             false, bits, thread_index);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
       for (ushort index = 0; index < running.get_capacity(); ++index) {
@@ -149,8 +145,7 @@ inline void splash_kvzip_store_chunk_slab(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const SplashKvPage *page_table, device uchar *codec,
     constant SplashChunkedPrefillParams &params, uint slab_index,
-    threadgroup uint *group_tier, threadgroup uint *partial, threadgroup uint *spilled,
-    uint dimension, uint simd_lane, uint simd_group) {
+    threadgroup uint *partial, uint dimension, uint simd_lane, uint simd_group) {
   const uint first = params.committed_tokens;
   const uint last = params.committed_tokens + params.chunk_tokens - 1;
   const uint first_page = first / SplashKvPageTokens;
@@ -165,13 +160,10 @@ inline void splash_kvzip_store_chunk_slab(
   const uint row_begin = max(first, page_first) - page_first;
   const uint row_end = min(last + 1, page_first + SplashKvPageTokens) - page_first;
   const SplashKvZipAddressing<KVHeads> addressing(params.kv);
-  const SplashKvPage entry = page_table[page];
-  const SplashKvZipSlab slab = addressing.slab(entry, head, value_tensor);
+  const SplashKvZipSlab slab = addressing.slab(page_table[page], head, value_tensor);
   const SplashKvZipChunkRows source{chunk_keys, chunk_values, params.chunk_stride, head,
                                     page_first - first, dimension, value_tensor};
-  splash_kvzip_store_rows<KVHeads>(slab, addressing.spill(entry, codec),
-                                   addressing.bases(codec, head, value_tensor),
-                                   reinterpret_cast<device atomic_uint *>(codec), row_begin,
-                                   row_end, source, group_tier, partial, spilled, dimension,
-                                   simd_lane, simd_group);
+  splash_kvzip_store_rows(slab, addressing.bases(codec, head, value_tensor),
+                          reinterpret_cast<device atomic_uint *>(codec), row_begin, row_end,
+                          source, partial, dimension, simd_lane, simd_group);
 }

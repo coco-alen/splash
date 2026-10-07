@@ -400,9 +400,7 @@ public:
     std::vector<uint16_t> rows(kRows * kDims);
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
       for (uint32_t page = 0; page * kRows < plan_.histories[lane]; ++page) {
-        const ZipPage zip{pages_, plan_.geometry.poolLayers, heads, pageIds_[lane][page],
-                          plan_.geometry.layer};
-        zip.setCounter(SPLASH_KVZIP_SPILL_START);
+        const ZipPage zip{pages_, heads, pageIds_[lane][page], plan_.geometry.layer};
         const uint32_t count = std::min(kRows, plan_.histories[lane] - page * kRows);
         for (uint32_t tensor = 0; tensor < 2; ++tensor)
           for (uint32_t head = 0; head < heads; ++head) {
@@ -410,7 +408,7 @@ public:
               for (uint32_t d = 0; d < kDims; ++d)
                 rows[row * kDims + d] = element(lane, tensor, head, page * kRows + row, d);
             if (storeRows(zip, tensor, head, rows.data(), 0, count, bases[tensor * heads + head]))
-              throw std::runtime_error("attention fixture ZBF16 history lost groups");
+              throw std::runtime_error("attention fixture ZBF16 history dropped escapes");
           }
       }
   }

@@ -92,7 +92,7 @@ public:
   // ZBF16's codec buffer, which its store and attention kernels bind: a
   // header with the overflow count, then the bases. Empty for other formats.
   [[nodiscard]] const metal::MetalBuffer &codec() const noexcept { return codec_; }
-  // Slabs a ZBF16 store could not hold whole since startup (abi/KvZip.h);
+  // Slabs whose ZBF16 store dropped escapes since startup (abi/KvZip.h);
   // zero for other formats.
   [[nodiscard]] uint32_t zipOverflowSlabs() const noexcept;
 

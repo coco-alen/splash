@@ -137,7 +137,7 @@ void RuntimeBootstrap::reportKvZipOverflow() {
   if (slabs == kvZipOverflowLogged_)
     return;
   logLine("error: ", slabs - kvZipOverflowLogged_,
-          " ZBF16 KV slabs outgrew their page's slots and spill pool and lost exponent "
+          " ZBF16 KV slabs had more escapes than their table holds and lost exponent "
           "bits (", slabs, " since start); the requests that wrote them attend "
           "approximate values. Recalibrate the model's bases "
           "(dev/tools/kvzip_calibrate.py) or serve with --kv-format bf16.");

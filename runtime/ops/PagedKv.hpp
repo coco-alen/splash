@@ -38,7 +38,7 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2, ZipBFloat16 = 3 };
   case Format::BFloat16:
     return "bf16_k_token_major_v_dimension_major";
   case Format::ZipBFloat16:
-    return "nplg_bf16_lossless_k_v_token_major_slot_and_page_spill";
+    return "bf16_lossless_4bit_exponent_window_k_v_token_major_escapes";
   }
   return "invalid";
 }
@@ -161,8 +161,8 @@ struct Layout final {
   // An extent holds a whole number of these pages, so that every tensor
   // region starts 64 KiB-aligned. The INT8 scales are the tightest
   // constraint: 4 heads require 128 pages and 2 heads require 256. BF16
-  // needs only 1 or 2 pages; ZBF16's flag and overflow region 64 (4 heads)
-  // or 128 (2 heads). This is allocation geometry only; prefix
+  // needs only 1 or 2 pages; ZBF16's escape region 16 (4 heads) or 32 (2
+  // heads). This is allocation geometry only; prefix
   // matching remains Page32 in both cases.
   [[nodiscard]] constexpr uint32_t extentAlignmentPages() const noexcept {
     if (format == Format::BFloat16)

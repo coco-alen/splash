@@ -20,9 +20,7 @@
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
-    threadgroup uint group_tier[SPLASH_KVZIP_GROUPS_PER_ROW];                  \
     threadgroup uint partial[8];                                               \
-    threadgroup uint spilled;                                                  \
     constexpr uint SlabsPerLane = 2 * 2 * Heads;                               \
     const uint batch = group / SlabsPerLane;                                   \
     constant SplashChunkedPrefillParams &lane_params = params[batch];          \
@@ -38,34 +36,12 @@
     splash_kvzip_store_chunk_slab<Heads>(                                      \
         chunk_keys + batch * lane_tensor_stride,                               \
         chunk_values + batch * lane_tensor_stride, page_table, codec,          \
-        lane_params, group % SlabsPerLane, group_tier, partial, &spilled,      \
-        thread_index, simd_lane, simd_group);                                  \
+        lane_params, group % SlabsPerLane, partial, thread_index, simd_lane,   \
+        simd_group);                                                           \
   }
 PAGED_VERIFY_ZIP_STORE(verify_attention_zip_store, 4)
 PAGED_VERIFY_ZIP_STORE(verify_attention_zip_store_kv2_g8, 2)
 #undef PAGED_VERIFY_ZIP_STORE
-
-// Before layer 0's store: resets the spill pool of each page a lane's rows
-// start, two threads per lane.
-#define PAGED_VERIFY_ZIP_RESET(Name, Heads)                                    \
-  kernel void Name(device const SplashKvPage *page_table0 [[buffer(0)]],       \
-                   device const SplashKvPage *page_table1 [[buffer(1)]],       \
-                   device const SplashKvPage *page_table2 [[buffer(2)]],       \
-                   device const SplashKvPage *page_table3 [[buffer(3)]],       \
-                   constant SplashChunkedPrefillParams *params [[buffer(4)]],  \
-                   uint position [[thread_position_in_grid]]) {                  \
-    const uint batch = position / 2;                                             \
-    constant SplashChunkedPrefillParams &lane_params = params[batch];          \
-    if (!splash_chunk_contract_valid(lane_params))                             \
-      return;                                                                  \
-    splash_kvzip_reset_chunk_spill<Heads>(                                     \
-        SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2,      \
-                            page_table3),                                      \
-        lane_params, position % 2);                                            \
-  }
-PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset, 4)
-PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset_kv2_g8, 2)
-#undef PAGED_VERIFY_ZIP_RESET
 
 // Split: the BF16 verify split's grid and slots over decoded pages.
 #define PAGED_VERIFY_ZIP_SPLIT(Name, Heads, Group)                             \
@@ -80,9 +56,7 @@ PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset_kv2_g8, 2)
       device const uchar *codec [[buffer(7)]],                                 \
       constant SplashVerifyAttentionParams *params [[buffer(8)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]],                       \
-      uint simd_lane [[thread_index_in_simdgroup]],                            \
-      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                      \
     constexpr uint N = SplashKvPageTokens;                                     \
     constexpr uint D = SplashKvHeadDimension;                                  \
@@ -90,12 +64,10 @@ PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset_kv2_g8, 2)
                   "a page's scores fit the decoded tile they share");          \
     alignas(16) threadgroup bfloat probabilities[M * N];                       \
     alignas(16) threadgroup bfloat kv_tile[N * D];                             \
-    threadgroup uint slot_words[SPLASH_KVZIP_SLOT_BYTES / 4 + 2];                \
     threadgroup float row_max[M];                                              \
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
     threadgroup atomic_uint rescale;                                           \
-    threadgroup uint partial[8];                                               \
     const uint kv_head = group.x, split = group.y, batch = group.z;            \
     constant SplashVerifyAttentionParams &lane_params = params[batch];         \
     if (!splash_verify_attention_contract_valid(lane_params) ||                \
@@ -112,8 +84,7 @@ PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset_kv2_g8, 2)
         lane_params.kv, codec, kv_head, lane_params.committed_tokens,          \
         SPLASH_TARGET_VERIFY_ROWS, lane_params.split_count, split, partials,   \
         statistics, slot, probabilities, row_max, row_sum, previous_scale,     \
-        &rescale, kv_tile, partial, slot_words, thread_index, simd_lane,       \
-        simd_group);                                                           \
+        &rescale, kv_tile, thread_index);                                      \
   }
 PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split, 4, 6)
 PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split_kv2_g8, 2, 8)

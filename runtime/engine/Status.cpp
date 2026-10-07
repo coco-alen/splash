@@ -111,13 +111,13 @@ std::string runtimeStatusJson(
       << ",\"format\":" << json::quote(kv::formatName(kvFormat))
       << ",\"quantization\":"
       << json::quote(kvFormat == kv::Format::Int8          ? "symmetric_int8"
-                     : kvFormat == kv::Format::ZipBFloat16 ? "lossless_nplg"
+                     : kvFormat == kv::Format::ZipBFloat16 ? "lossless_exponent_window"
                                                            : "none")
       << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
       << ",\"key_layout\":\"token_major\""
       << ",\"value_layout\":"
       << json::quote(kvFormat == kv::Format::ZipBFloat16 ? "token_major" : "dimension_major");
-  // ZBF16 slabs that lost groups to an exhausted spill pool (abi/KvZip.h).
+  // ZBF16 slabs that stored escapes past their table (abi/KvZip.h).
   if (kvFormat == kv::Format::ZipBFloat16)
     out << ",\"overflow_slabs\":" << kvZipOverflowSlabs;
   out << "}},"

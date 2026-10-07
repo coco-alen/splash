@@ -110,13 +110,6 @@ void requireRopeTables(const metal::MetalBuffer &cosine, const metal::MetalBuffe
 
 enum class Stage : uint8_t { PrefillStore, PrefillSplit, VerifyStore, VerifySplit };
 
-// ZBF16 resets the spill pool of each page a command starts before the first
-// attention layer's store (abi/KvZip.h): the pool's counter lies in layer 0.
-std::string zipReset(std::string_view phase, KernelLayout layout) {
-  return std::string(phase) + "_attention_zip_reset" +
-         (layout == KernelLayout::Kv2Group8 ? "_kv2_g8" : "");
-}
-
 // The kernel of a stage for the page format, INT8, BF16 or ZBF16, in the
 // GQA layout. Plans keep these names as views of the literals.
 std::string_view formatPipeline(kv::Format format, KernelLayout layout, Stage stage) {
@@ -405,11 +398,7 @@ void PagedAttention::addPrefillStore(
               {layout.headDimension, 1, 1});
     return;
   }
-  // ZBF16: the first layer's store starts the spill pools of the pages the
-  // chunk starts; a threadgroup encodes a KV head's rows of one page.
-  if (layer.offset == 0)
-    graph.add(zipReset("prefill", kernel), {pageTable}, layerParams,
-              {chunkPages(params), 1, 1}, {1, 1, 1});
+  // ZBF16: a threadgroup encodes a KV head's rows of one page.
   graph.add(std::string(formatPipeline(layout.format, kernel, Stage::PrefillStore)),
             {chunkKeys, chunkValues, pageTable, zip.codec}, layerParams,
             {uint64_t{2} * chunkPages(params) * layout.kvHeads, 1, 1},
@@ -508,10 +497,6 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   if (zip) {
     store.push_back(buffers.kvCodec);
     split.push_back(buffers.kvCodec);
-    if (layer.offset == 0)
-      graph.add(zipReset("verify", storageKernelLayout(plan.layout)),
-                {tables[0], tables[1], tables[2], tables[3]}, stores,
-                {uint64_t{plan.lanes} * 2, 1, 1}, {1, 1, 1});
   }
   graph.add(std::string(plan.storePipeline_), std::move(store), stores, plan.storeGroups_,
             plan.storeThreads_);

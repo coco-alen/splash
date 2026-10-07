@@ -36,8 +36,8 @@ constexpr uint32_t kLayer = 1;
 
 // ---------------------------------------------------------------------------
 // KV-like test values: per (head, dimension) a Gaussian of its own scale, a
-// few outliers and exact zeros, so every tier occurs. Harsh values have ten
-// times the outliers, so rows spill.
+// few outliers and exact zeros, so values escape their window. Harsh values
+// have ten times the outliers.
 
 struct Values final {
   // [tensor][head] token-major rows of the whole sequence.
@@ -107,11 +107,11 @@ struct Pool final {
   std::array<std::vector<HeadBases>, 2> bases;
   uint32_t tested = kLayer;
 
-  ZipPage page(uint32_t id) const { return {extents, layout.attentionLayers, layout.kvHeads, id, tested}; }
+  ZipPage page(uint32_t id) const { return {extents, layout.kvHeads, id, tested}; }
 };
 
 // The layer under test is `tested`: kLayer, past layer 0's region, unless
-// the case needs layer 0's own store (which resets the spill pools).
+// the case needs layer 0's own store.
 Pool makePool(metal::MetalBackend &backend, kv::Format format, uint32_t kvHeads, uint32_t pages,
               const std::array<std::vector<HeadBases>, 2> &bases, uint32_t layers = 4,
               uint32_t tested = kLayer) {
@@ -142,8 +142,8 @@ Pool makePool(metal::MetalBackend &backend, kv::Format format, uint32_t kvHeads,
 }
 
 // Writes tokens [0, tokens) of a sequence into its pages, as committed
-// history: BF16 as it is, ZBF16 through the host store, each page's spill
-// pool reset first. Stale bytes fill the rest of every page, as a reused
+// history: BF16 as it is, ZBF16 through the host store. Stale bytes fill
+// the rest of every page, as a reused
 // page holds: any bytes for ZBF16, finite values for BF16 (a BF16 page's
 // stale rows are earlier KV, and its kernels weigh them by exact zeros).
 void writeHistory(Pool &pool, const std::vector<uint32_t> &pages, const Values &values, uint32_t tokens) {
@@ -156,9 +156,6 @@ void writeHistory(Pool &pool, const std::vector<uint32_t> &pages, const Values &
         if (pool.layout.format == kv::Format::BFloat16)
           for (uint64_t byte = 1; byte < count; byte += 2) bytes[byte] = uint8_t(0x3C | (bytes[byte] & 0x80));
       }
-  if (pool.layout.format == kv::Format::ZipBFloat16)
-    for (uint32_t page = 0; page * kRows < std::max(tokens, 1U) && page < pages.size(); ++page)
-      pool.page(pages[page]).setCounter(SPLASH_KVZIP_SPILL_START);
   for (uint32_t tensor = 0; tensor < 2; ++tensor)
     for (uint32_t head = 0; head < pool.layout.kvHeads; ++head) {
       const auto &rows = values.rows[tensor][head];
@@ -175,7 +172,7 @@ void writeHistory(Pool &pool, const std::vector<uint32_t> &pages, const Values &
         } else {
           require(!storeRows(pool.page(pages[page]), tensor, head, rows.data() + uint64_t{page} * kRows * kDims,
                              0, count, pool.bases[tensor][head]),
-                  "test history lost groups");
+                  "test history dropped escapes");
         }
       }
     }
@@ -195,13 +192,11 @@ void stage(const Values &values, uint32_t kvHeads, uint32_t first, uint32_t coun
 }
 
 // Every committed row of a ZBF16 sequence decodes to its value bits, and the
-// store wrote what the host store writes: sign/mantissa bytes, codes, flags,
-// which rows sit in the slot and the slot's bytes. Spilled rows' places in
-// the pool depend on the order the kernels took them in, so only their
-// decoded values are compared. Returns the rows that spilled.
+// store wrote what the host store writes: sign/mantissa bytes, codes, and
+// the escapes in row order. Returns the escapes stored.
 uint32_t requireDecodes(const Pool &pool, const std::vector<uint32_t> &pages, const Values &values,
                         uint32_t tokens, const std::string &what) {
-  uint32_t spilled = 0;
+  uint32_t escapes = 0;
   for (uint32_t tensor = 0; tensor < 2; ++tensor)
     for (uint32_t head = 0; head < pool.layout.kvHeads; ++head)
       for (uint32_t page = 0; page * kRows < tokens; ++page) {
@@ -213,43 +208,30 @@ uint32_t requireDecodes(const Pool &pool, const std::vector<uint32_t> &pages, co
                                   std::to_string(head) + ", page " + std::to_string(page) + ")";
         require(std::equal(decoded.begin(), decoded.end(), expected),
                 where + ": a stored row does not decode to its bits");
-        // The host store's bytes, on a copy of the slab's data and aux with
-        // a spill pool of its own.
-        std::vector<uint8_t> data(SPLASH_KVZIP_DATA_BYTES_PER_HEAD), aux(SPLASH_KVZIP_AUX_BYTES_PER_HEAD);
-        const uint8_t *actualData = zip.data(tensor, head), *actualAux = zip.aux(tensor, head);
-        const auto *actualSpill = reinterpret_cast<const uint16_t *>(actualAux + SPLASH_KVZIP_SPILL_ROWS_OFFSET);
-        uint32_t used = 0;
+        const uint8_t *actualData = zip.data(tensor, head);
+        const uint32_t *actualEscapes = zip.escapes(tensor, head);
+        uint32_t stored = 0;
         for (uint32_t row = 0; row < count; ++row) {
-          const RowCode code = encodeRow(expected + row * kDims, pool.bases[tensor][head]);
-          const bool inSlot = !code.total || used + code.total <= SPLASH_KVZIP_SLOT_BYTES;
-          require(inSlot == (actualSpill[row] == SPLASH_KVZIP_IN_SLOT),
-                  where + ": row " + std::to_string(row) + " is in the wrong place");
-          spilled += !inSlot;
-          std::array<uint32_t, 2> words{};
-          uint32_t offset = 0;
-          for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
-            words[group / 16] |= code.tier[group] << (2 * (group % 16));
-            const uint8_t *codes =
-                actualData + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + group * 3;
-            require(uint32_t(codes[0] | codes[1] << 8 | codes[2] << 16) == code.word[group],
-                    where + ": code words differ from the host store's");
-            if (inSlot)
-              for (uint32_t byte = 0; byte < flagCost(code.tier[group]); ++byte)
-                require(actualAux[SPLASH_KVZIP_SLOT_OFFSET + used + offset + byte] == code.bytes[group][byte],
-                        where + ": slot bytes differ from the host store's");
-            offset += flagCost(code.tier[group]);
-          }
-          require(std::memcmp(actualAux + row * 8, words.data(), 8) == 0,
-                  where + ": flags differ from the host store's");
+          const RowCode code = encodeRow(expected + row * kDims, row, pool.bases[tensor][head]);
+          for (uint32_t pair = 0; pair < kDims / 2; ++pair)
+            require(actualData[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + pair] ==
+                        uint8_t(code.code[2 * pair] | (code.code[2 * pair + 1] << 4)),
+                    where + ": codes differ from the host store's");
           for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
             const uint32_t bits = expected[row * kDims + dimension];
             require(actualData[row * kDims + dimension] == uint8_t(((bits >> 8) & 0x80) | (bits & 0x7F)),
                     where + ": sign/mantissa bytes differ from the host store's");
           }
-          if (inSlot) used += code.total;
+          for (const uint32_t escape : code.escapes) {
+            require(stored < SPLASH_KVZIP_ESCAPES && actualEscapes[stored] == escape,
+                    where + ": escape " + std::to_string(stored) + " differs from the host store's");
+            ++stored;
+          }
         }
+        require(zip.count(tensor, head) == stored, where + ": the escape count differs from the host store's");
+        escapes += stored;
       }
-  return spilled;
+  return escapes;
 }
 
 uint32_t overflowSlabs(const Pool &pool) {
@@ -314,10 +296,9 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t hi
     static_cast<uint16_t *>(queries.contents())[index] = floatToBf16(normal(random));
 
   std::array<std::vector<uint16_t>, 2> outputs;
-  uint32_t spilled = 0;
+  uint32_t escapes = 0;
   for (const kv::Format format : {kv::Format::BFloat16, kv::Format::ZipBFloat16}) {
-    // Harsh values spill: a model's 16 layers give each page its spill pool.
-    Pool pool = makePool(backend, format, kvHeads, pageCount, bases, harsh ? 16 : 4);
+    Pool pool = makePool(backend, format, kvHeads, pageCount, bases);
     const auto pages = distinctPages(pool, pageCount, tokens);
     writeHistory(pool, pages, values, history);
     auto table = allocate(backend, uint64_t{pageCount} * sizeof(SplashKvPage));
@@ -327,19 +308,9 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t hi
     auto output = allocate(backend, queries.sizeBytes());
     auto partials = allocate(backend, plan.workspace.partialsBytes);
     auto statistics = allocate(backend, plan.workspace.statisticsBytes);
-    // The layer under test is not layer 0, whose store resets the spill
-    // pools of the pages a command starts: layer 0's reset runs first.
     const ops::KvZipPrefill zip =
         format == kv::Format::ZipBFloat16 ? zipPrefill(backend, pool) : ops::KvZipPrefill{};
-    metal::CommandGraph reset, graph;
-    std::vector<metal::ComputeDispatch> dispatches;
-    if (format == kv::Format::ZipBFloat16) {
-      ops::PagedAttention::addPrefillStore(reset, pool.extents.layer(0), keys, staged, table, chunk, pool.layout,
-                                          zip);
-      require(reset.dispatches()[0].pipelineName.find("zip_reset") != std::string::npos,
-              "layer 0's ZBF16 prefill store should reset the spill pools first");
-      dispatches.push_back(reset.dispatches()[0]);
-    }
+    metal::CommandGraph graph;
     ops::PagedAttention::addPrefillStore(graph, pool.layer, keys, staged, table, chunk, pool.layout, zip);
     require(format != kv::Format::ZipBFloat16 ||
                 graph.dispatches().size() == (history ? 3U : 2U),
@@ -348,10 +319,9 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t hi
                                     zip);
     require(std::string(plan.splitPipeline).find("bf16_split") != std::string::npos,
             "prefill should attend through the BF16 split");
-    dispatches.insert(dispatches.end(), graph.dispatches().begin(), graph.dispatches().end());
-    (void)backend.submitCommandAsync(dispatches).wait();
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
     if (format == kv::Format::ZipBFloat16) {
-      spilled = requireDecodes(pool, pages, values, tokens, "prefill store");
+      escapes = requireDecodes(pool, pages, values, tokens, "prefill store");
       require(overflowSlabs(pool) == 0, "prefill store counted an overflow");
     }
     const auto *bits = static_cast<const uint16_t *>(output.contents());
@@ -359,9 +329,9 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t hi
   }
   const std::string difference = compare(outputs[0], outputs[1]);
   require(difference.empty(), "ZBF16 prefill attention differs from BF16: " + difference);
-  require(!harsh || spilled, "harsh values did not spill");
+  require(escapes, "no value escaped its window");
   std::cout << "zbf16 prefill: q=" << queryHeads << " history=" << history << " rows=" << rows
-            << (harsh ? " harsh" : "") << " spilled rows=" << spilled << " PASS (bit-equal to bf16)\n";
+            << (harsh ? " harsh" : "") << " escapes=" << escapes << " PASS (bit-equal to bf16)\n";
 }
 
 // Verify of `lanes` lanes at the given histories, twice: the second command
@@ -394,7 +364,7 @@ void checkVerify(metal::MetalBackend &backend, uint32_t queryHeads, std::array<u
   const auto bases = calibrate(makeValues(kvHeads, 4096, 999));
   std::array<std::array<std::vector<uint16_t>, 2>, 2> outputs;
   for (const kv::Format format : {kv::Format::BFloat16, kv::Format::ZipBFloat16}) {
-    // The layer under test is layer 0, so the verify encodes its reset.
+    // The layer under test is layer 0.
     Pool pool = makePool(backend, format, kvHeads, allPages, bases, 4, 0);
     Pool &host = pool;
     const auto ids = distinctPages(pool, allPages, allPages + lanes);
@@ -436,8 +406,7 @@ void checkVerify(metal::MetalBackend &backend, uint32_t queryHeads, std::array<u
       ops::PagedAttention::addVerify(graph, pool.layer,
                                      {keys, staged, queries, partials, statistics, output, tables, pool.codec},
                                      std::span(chunks).first(lanes), plan);
-      require(graph.dispatches().size() == (format == kv::Format::ZipBFloat16 ? 4U : 3U),
-              "verify should encode reset (ZBF16, layer 0), store, split and reduce");
+      require(graph.dispatches().size() == 3, "verify should encode store, split and reduce");
       (void)backend.submitCommandAsync(graph.dispatches()).wait();
       const auto *bits = static_cast<const uint16_t *>(output.contents());
       outputs[step][format == kv::Format::ZipBFloat16] = {bits, bits + output.sizeBytes() / 2};
@@ -458,10 +427,10 @@ void checkVerify(metal::MetalBackend &backend, uint32_t queryHeads, std::array<u
             << ".." << histories[lanes - 1] << " PASS (bit-equal to bf16, rejected rows rewritten)\n";
 }
 
-// Rows of uniformly random bits need ten times what slots and spill pool
-// hold: every slab is counted, the groups that did not fit decode finite and
-// the rows stored whole decode exactly; no byte past the page changes.
-void checkExhausted(metal::MetalBackend &backend) {
+// Rows of uniformly random bits escape far more often than the table holds:
+// every slab is counted, the elements whose escapes were dropped decode
+// finite and the rest exact; no byte past the page changes.
+void checkEscapeOverflow(metal::MetalBackend &backend) {
   constexpr uint32_t kvHeads = 4, rows = 32;
   Values values;
   values.tokens = rows;
@@ -476,7 +445,6 @@ void checkExhausted(metal::MetalBackend &backend) {
   const auto pages = distinctPages(pool, 3, 9);
   auto table = allocate(backend, 3 * sizeof(SplashKvPage));
   pool.extents.writeTable(pages, table.contents());
-  // The neighbouring pages' bytes must not change.
   std::vector<std::vector<uint8_t>> before;
   for (uint32_t extent = 0; extent < pool.extents.extentCount(); ++extent) {
     const auto bytes = pool.extents.bytes(extent);
@@ -491,32 +459,29 @@ void checkExhausted(metal::MetalBackend &backend) {
   ops::PagedAttention::addPrefillStore(graph, pool.layer, keys, staged, table,
                                       ops::PagedAttention::prefillParams(0, rows, rows, 1), pool.layout,
                                       zipPrefill(backend, pool));
-  require(graph.dispatches()[0].pipelineName.find("zip_reset") != std::string::npos,
-          "layer 0's prefill store should reset the spill pools first");
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
-  require(overflowSlabs(pool) == 2 * kvHeads, "every slab that lost groups must be counted once, got " +
+  require(overflowSlabs(pool) == 2 * kvHeads, "every slab that dropped escapes must be counted once, got " +
                                                   std::to_string(overflowSlabs(pool)));
   const ZipPage zip = pool.page(pages[0]);
-  require(zip.counter() > zip.capacity(), "the spill pool was not exhausted");
   uint32_t exact = 0;
   for (uint32_t tensor = 0; tensor < 2; ++tensor)
     for (uint32_t head = 0; head < kvHeads; ++head) {
+      require(zip.count(tensor, head) == SPLASH_KVZIP_ESCAPES, "a full escape table should hold every entry");
       const auto decoded = decodeSlab(zip, tensor, head, rows, bases[tensor][head]);
-      const auto *aux = zip.aux(tensor, head);
-      const auto *flags = reinterpret_cast<const uint32_t *>(aux);
-      for (uint32_t row = 0; row < rows; ++row) {
-        bool lost = false;
-        for (uint32_t word = 0; word < 2; ++word)
-          lost |= ((flags[2 * row + word] >> 1) & ~flags[2 * row + word] & 0x55555555u) != 0;
-        bool same = true;
-        for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
-          const uint16_t bits = decoded[row * kDims + dimension];
-          require(((bits >> 7) & 0xFF) != 0xFF || ((values.rows[tensor][head][row * kDims + dimension] >> 7) & 0xFF) == 0xFF,
-                  "a lost group decoded to an infinity or NaN it did not hold");
-          same &= bits == values.rows[tensor][head][row * kDims + dimension];
-        }
-        require(lost || same, "a row stored whole does not decode to its bits");
-        exact += !lost;
+      // The host store on the same values says which elements kept their
+      // escapes: the first table's worth, in row order.
+      std::vector<uint32_t> kept;
+      for (uint32_t row = 0; row < rows && kept.size() < SPLASH_KVZIP_ESCAPES; ++row)
+        for (const uint32_t escape : encodeRow(values.rows[tensor][head].data() + row * kDims, row, bases[tensor][head]).escapes)
+          if (kept.size() < SPLASH_KVZIP_ESCAPES) kept.push_back(escape & 0xFFFF);
+      for (uint32_t position = 0; position < rows * kDims; ++position) {
+        const uint16_t bits = decoded[position], source = values.rows[tensor][head][position];
+        const uint32_t delta = (((source >> 7) & 0xFF) - bases[tensor][head].base4[position % kDims]) & 0xFF;
+        const bool escaped = delta >= 16;
+        const bool dropped = escaped && !std::binary_search(kept.begin(), kept.end(), position);
+        require(((bits >> 7) & 0xFF) != 0xFF || !dropped, "a dropped escape decoded to an infinity or NaN");
+        require(dropped || bits == source, "an element with its escape does not decode to its bits");
+        exact += !dropped;
       }
     }
   for (uint32_t extent = 0; extent < pool.extents.extentCount(); ++extent) {
@@ -530,28 +495,28 @@ void checkExhausted(metal::MetalBackend &backend) {
           const uint64_t offset = pool.extents.slab<uint8_t>(layer, tensor, id) - after;
           const uint64_t count = tensor % 2 ? pool.layout.scaleBytesPerLayerPage() : pool.layout.dataBytesPerLayerPage();
           require(std::equal(after + offset, after + offset + count, before[extent].begin() + offset),
-                  "an exhausted store wrote outside its page");
+                  "an overflowing store wrote outside its page");
         }
     }
   }
-  std::cout << "zbf16 exhausted spill: " << overflowSlabs(pool) << " slabs counted, " << exact
-            << " whole rows exact, lost groups finite, other pages intact PASS\n";
+  std::cout << "zbf16 escape overflow: " << overflowSlabs(pool) << " slabs counted, " << exact
+            << " elements exact, dropped escapes finite, other pages intact PASS\n";
 }
 
 void checkLayout() {
   for (const uint32_t heads : {4U, 2U}) {
     const kv::Layout zip{16, heads, 256, kv::Format::ZipBFloat16};
     const kv::Layout bf16{16, heads, 256, kv::Format::BFloat16};
-    require(zip.valid() && zip.dataBytesPerLayerPage() == heads * 11264ull &&
-                zip.scaleBytesPerLayerPage() == heads * 768ull,
+    require(zip.valid() && zip.dataBytesPerLayerPage() == heads * 12288ull &&
+                zip.scaleBytesPerLayerPage() == heads * 1024ull,
             "ZBF16 page geometry changed");
-    require(zip.bytesPerModelPage() * 1000 / bf16.bytesPerModelPage() == 734,
-            "ZBF16 pages should be 0.734 of BF16's");
-    require(zip.extentAlignmentPages() == (heads == 4 ? 64U : 128U), "ZBF16 extent alignment changed");
+    require(zip.bytesPerModelPage() * 1000 / bf16.bytesPerModelPage() == 812,
+            "ZBF16 pages should be 0.8125 of BF16's");
+    require(zip.extentAlignmentPages() == (heads == 4 ? 16U : 32U), "ZBF16 extent alignment changed");
   }
   require(!kv::Layout{16, 4, 128, kv::Format::ZipBFloat16}.valid(),
           "ZBF16 accepted a head dimension its codec does not cover");
-  std::cout << "zbf16 layout: 0.734x of bf16 pages PASS\n";
+  std::cout << "zbf16 layout: 0.8125x of bf16 pages PASS\n";
 }
 
 } // namespace
@@ -561,7 +526,7 @@ int main(int argc, char **argv) {
     checkLayout();
     if (argc < 2) return 0;
     metal::MetalBackend backend(argv[1]);
-    checkExhausted(backend);
+    checkEscapeOverflow(backend);
     for (const uint32_t heads : {24U, 16U}) {
       for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 6>{
                {{0, 1}, {0, 64}, {13, 50}, {100, 77}, {1023, 257}, {4093, 1057}}})

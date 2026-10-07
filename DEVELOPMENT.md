@@ -201,18 +201,23 @@ to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
 The [SSD cache](#ssd-cache) supports every format, preserving their stored
 bytes without further quantization.
 
-`--kv-format zbf16` keeps BF16 KV bit for bit in 0.734 of its memory (1.47 MiB
-instead of 2 MiB per 27B page): each value's sign and mantissa as they are, and
-its exponent as a 3-bit code in a window that each (layer, KV head, dimension)
-calibrates per model family, with groups of eight values promoted to a
-16-binade window or raw exponents when they leave it (`runtime/metal/abi/KvZip.h`).
-The attention kernels decode each page into threadgroup memory and attend
-exactly as BF16 does; outputs match `--kv-format bf16` bit for bit. Only model
-families with a calibration start (Qwen3.8-27B); calibrate one from BF16 pages
-the persistent cache captured with `dev/tools/kvzip_calibrate.py`. A page whose
-promoted groups outgrow its slots and its spill pool, which real and repetitive
-prompts stay far from, loses those groups' exponents: `/status` counts its
-slabs as `identity.kv.overflow_slabs` and the server logs an error.
+`--kv-format zbf16` keeps BF16 KV bit for bit in 0.81 of its memory (1.63 MiB
+instead of 2 MiB per 27B page, so 23% more context in the same memory): each
+value's sign and mantissa as they are, and its exponent as a 4-bit code in a
+16-binade window that each (layer, KV head, dimension) calibrates per model
+family, with the rare value outside its window listed as an escape
+(`runtime/metal/abi/KvZip.h`; the coding follows SplitZip). Outputs match
+`--kv-format bf16` bit for bit: prefill decodes a chunk's history into a BF16
+scratch and runs the BF16 kernels, and decode's attention decodes each page into
+threadgroup memory and attends as BF16 does. Prefill costs about what BF16's
+does; decode attention takes 13–16% longer per layer at 128K history (M5 Pro:
+27B 3.06 ms against 2.71, 35B 1.79 against 1.54), less at shorter ones. Only
+model families with a calibration start (Qwen3.8-27B, Qwen3.6-35B-A3B);
+calibrate one from BF16 pages the persistent cache captured with
+`dev/tools/kvzip_calibrate.py`. A slab with more escapes than its table holds
+(252 per 8,192 values; real and repetitive prompts need under 200) stores the
+rest approximately: `/status` counts such slabs as `identity.kv.overflow_slabs`
+and the server logs an error.
 
 ### SSD cache
 

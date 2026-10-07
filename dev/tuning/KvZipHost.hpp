@@ -10,28 +10,25 @@
 #include <cstring>
 #include <vector>
 
+// Host reference codec of ZBF16 pages (metal/abi/KvZip.h): what the store
+// kernels write and the attention kernels read, for kernel tests and the
+// attention fixture.
 namespace splash::ops::tuning::kvzip {
 
 constexpr uint32_t kRows = SPLASH_KVZIP_ROWS;
 constexpr uint32_t kDims = SPLASH_KVZIP_DIMENSIONS;
 
-// ---------------------------------------------------------------------------
-// Host reference codec of ZBF16 pages (metal/abi/KvZip.h): what the store
-// kernels write and the attention kernels read, for kernel tests and the
-// attention fixture.
-
+// A head's windows: ZBF16 codes against base4; base3 is the calibration
+// format's other window.
 struct HeadBases final {
   std::array<uint8_t, kDims> base3{};
   std::array<uint8_t, kDims> base4{};
 };
 
-inline uint32_t flagCost(uint32_t flags) { return splash_kvzip_flag_cost(flags); }
-
-// One ZBF16 page of a host pool: its slabs in one layer and its spill pool
-// across every layer.
+// One ZBF16 page of a host pool, in one layer.
 struct ZipPage final {
   const HostKvExtents &extents;
-  uint32_t layers, kvHeads, page, layer;
+  uint32_t kvHeads, page, layer;
 
   uint8_t *data(uint32_t tensor, uint32_t head) const {
     return extents.slab<uint8_t>(layer, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, page) +
@@ -41,148 +38,96 @@ struct ZipPage final {
     return extents.slab<uint8_t>(layer, tensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, page) +
            head * SPLASH_KVZIP_AUX_BYTES_PER_HEAD;
   }
-  uint8_t *spill(uint32_t at) const {
-    const uint32_t share = at / SPLASH_KVZIP_SHARE_BYTES;
-    const uint32_t owner = share / (2 * kvHeads), tensor = share / kvHeads % 2, head = share % kvHeads;
-    return extents.slab<uint8_t>(owner, tensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, page) +
-           head * SPLASH_KVZIP_AUX_BYTES_PER_HEAD + SPLASH_KVZIP_SHARE_OFFSET + at % SPLASH_KVZIP_SHARE_BYTES;
-  }
-  uint32_t capacity() const { return splash_kvzip_spill_bytes(layers, kvHeads); }
-  uint32_t counter() const {
+  uint32_t count(uint32_t tensor, uint32_t head) const {
     uint32_t value;
-    std::memcpy(&value, spill(0), 4);
+    std::memcpy(&value, aux(tensor, head), 4);
     return value;
   }
-  void setCounter(uint32_t value) const { std::memcpy(spill(0), &value, 4); }
+  uint32_t *escapes(uint32_t tensor, uint32_t head) const {
+    return reinterpret_cast<uint32_t *>(aux(tensor, head) + SPLASH_KVZIP_ESCAPE_HEADER_BYTES);
+  }
 };
 
-// One row's groups: tiers, code words and overflow bytes.
+// One row's codes and escapes.
 struct RowCode final {
-  std::array<uint32_t, SPLASH_KVZIP_GROUPS_PER_ROW> tier{}, word{};
-  std::array<std::array<uint8_t, 5>, SPLASH_KVZIP_GROUPS_PER_ROW> bytes{};
-  uint32_t total = 0;
+  std::array<uint8_t, kDims> code{};
+  std::vector<uint32_t> escapes; // position | exponent << 16
 };
 
-inline RowCode encodeRow(const uint16_t *row, const HeadBases &bases) {
+inline RowCode encodeRow(const uint16_t *row, uint32_t rowIndex, const HeadBases &bases) {
   RowCode code;
-  for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
-    bool all3 = true, all4 = true;
-    std::array<uint32_t, 8> exponent{};
-    for (uint32_t lane = 0; lane < 8; ++lane) {
-      const uint32_t dimension = group * 8 + lane;
-      exponent[lane] = (row[dimension] >> 7) & 0xFF;
-      const int d3 = int(exponent[lane]) - bases.base3[dimension];
-      const int d4 = int(exponent[lane]) - bases.base4[dimension];
-      all3 &= d3 >= 0 && d3 < 8;
-      all4 &= d4 >= 0 && d4 < 16;
+  for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+    const uint32_t exponent = (row[dimension] >> 7) & 0xFF;
+    const int delta = int(exponent) - bases.base4[dimension];
+    if (delta >= 0 && delta < 16) {
+      code.code[dimension] = uint8_t(delta);
+    } else {
+      code.escapes.push_back((rowIndex * kDims + dimension) | (exponent << 16));
     }
-    const uint32_t tier = all3 ? 0 : all4 ? 1 : 3;
-    uint32_t word = 0, window16 = 0;
-    uint64_t high = 0;
-    for (uint32_t lane = 0; lane < 8; ++lane) {
-      const uint32_t dimension = group * 8 + lane;
-      const uint32_t value = tier == 0   ? exponent[lane] - bases.base3[dimension]
-                             : tier == 1 ? exponent[lane] - bases.base4[dimension]
-                                         : exponent[lane];
-      word |= (value & 7) << (3 * lane);
-      window16 |= ((value >> 3) & 1) << lane;
-      high |= uint64_t(exponent[lane] >> 3) << (5 * lane);
-    }
-    code.tier[group] = tier;
-    code.word[group] = word;
-    for (uint32_t byte = 0; byte < 5; ++byte)
-      code.bytes[group][byte] = tier == 1 ? (byte ? 0 : uint8_t(window16)) : uint8_t(high >> (8 * byte));
-    code.total += flagCost(tier);
   }
   return code;
 }
 
 // Stores rows [begin, end) of a slab as the store kernels do; `rows` holds
-// the page's 32 token-major rows. Returns whether a row lost groups.
-inline bool storeRows(const ZipPage &page, uint32_t tensor, uint32_t head, const uint16_t *rows, uint32_t begin,
-               uint32_t end, const HeadBases &bases) {
-  uint8_t *data = page.data(tensor, head), *aux = page.aux(tensor, head);
-  auto *flags = reinterpret_cast<uint32_t *>(aux);
-  auto *spill = reinterpret_cast<uint16_t *>(aux + SPLASH_KVZIP_SPILL_ROWS_OFFSET);
-  uint8_t *slot = aux + SPLASH_KVZIP_SLOT_OFFSET;
-  uint32_t used = 0;
-  for (uint32_t row = 0; row < begin; ++row)
-    if (spill[row] == SPLASH_KVZIP_IN_SLOT) used += flagCost(flags[2 * row]) + flagCost(flags[2 * row + 1]);
-  bool lostAny = false;
-  for (uint32_t row = begin; row < end; ++row) {
-    RowCode code = encodeRow(rows + row * kDims, bases);
-    uint32_t at = SPLASH_KVZIP_IN_SLOT;
-    bool lost = false;
-    if (code.total && used + code.total > SPLASH_KVZIP_SLOT_BYTES) {
-      at = page.counter();
-      page.setCounter(at + code.total);
-      lost = at + code.total > page.capacity();
-    }
-    lostAny |= lost;
-    std::array<uint32_t, 2> words{};
-    uint32_t offset = 0;
-    for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
-      uint32_t tier = code.tier[group];
-      if (lost && tier) tier = SPLASH_KVZIP_TIER_LOST;
-      const uint32_t word = tier == SPLASH_KVZIP_TIER_LOST ? 0 : code.word[group];
-      uint8_t *codes = data + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + group * 3;
-      codes[0] = uint8_t(word), codes[1] = uint8_t(word >> 8), codes[2] = uint8_t(word >> 16);
-      words[group / 16] |= tier << (2 * (group % 16));
-      for (uint32_t byte = 0; byte < flagCost(tier); ++byte) {
-        if (at == SPLASH_KVZIP_IN_SLOT) slot[used + offset + byte] = code.bytes[group][byte];
-        else *page.spill(at + offset + byte) = code.bytes[group][byte];
+// the page's 32 token-major rows. Rows before `begin` keep their escapes.
+// Returns whether an escape was dropped.
+inline bool storeRows(const ZipPage &page, uint32_t tensor, uint32_t head, const uint16_t *rows,
+                      uint32_t begin, uint32_t end, const HeadBases &bases) {
+  uint8_t *data = page.data(tensor, head);
+  uint32_t *escapes = page.escapes(tensor, head);
+  uint32_t count = 0;
+  if (begin) {
+    count = std::min(page.count(tensor, head), SPLASH_KVZIP_ESCAPES);
+    for (uint32_t index = 0; index < count; ++index)
+      if ((escapes[index] & 0xFFFF) / kDims >= begin) {
+        count = index;
+        break;
       }
-      offset += flagCost(tier);
-    }
+  }
+  bool dropped = false;
+  for (uint32_t row = begin; row < end; ++row) {
+    const RowCode code = encodeRow(rows + row * kDims, row, bases);
     for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
       const uint32_t bits = rows[row * kDims + dimension];
       data[row * kDims + dimension] = uint8_t(((bits >> 8) & 0x80) | (bits & 0x7F));
     }
-    flags[2 * row] = words[0], flags[2 * row + 1] = words[1];
-    spill[row] = uint16_t(lost ? SPLASH_KVZIP_IN_SLOT : at);
-    if (at == SPLASH_KVZIP_IN_SLOT) used += code.total;
+    for (uint32_t pair = 0; pair < kDims / 2; ++pair)
+      data[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + pair] =
+          uint8_t(code.code[2 * pair] | (code.code[2 * pair + 1] << 4));
+    for (const uint32_t escape : code.escapes) {
+      if (count < SPLASH_KVZIP_ESCAPES)
+        escapes[count++] = escape;
+      else
+        dropped = true;
+    }
   }
-  return lostAny;
+  std::memcpy(page.aux(tensor, head), &count, 4);
+  return dropped;
 }
 
-// Decodes rows [0, rows) of a slab into BF16 bits, token-major; a lost group
-// decodes as the kernels decode it.
-inline std::vector<uint16_t> decodeSlab(const ZipPage &page, uint32_t tensor, uint32_t head, uint32_t rows,
-                                 const HeadBases &bases) {
-  const uint8_t *data = page.data(tensor, head), *aux = page.aux(tensor, head);
-  const auto *flags = reinterpret_cast<const uint32_t *>(aux);
-  const auto *spill = reinterpret_cast<const uint16_t *>(aux + SPLASH_KVZIP_SPILL_ROWS_OFFSET);
-  const uint8_t *slot = aux + SPLASH_KVZIP_SLOT_OFFSET;
+// Decodes rows [0, rows) of a slab into BF16 bits, token-major; a dropped
+// escape's element decodes as the kernels decode it.
+inline std::vector<uint16_t> decodeSlab(const ZipPage &page, uint32_t tensor, uint32_t head,
+                                        uint32_t rows, const HeadBases &bases) {
+  const uint8_t *data = page.data(tensor, head);
   std::vector<uint16_t> result(rows * kDims);
-  uint32_t used = 0;
-  for (uint32_t row = 0; row < rows; ++row) {
-    const bool inSlot = spill[row] == SPLASH_KVZIP_IN_SLOT;
-    uint32_t offset = inSlot ? used : spill[row];
-    for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
-      const uint32_t tier = (flags[2 * row + group / 16] >> (2 * (group % 16))) & 3;
-      const uint8_t *codes = data + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + group * 3;
-      const uint32_t word = codes[0] | codes[1] << 8 | codes[2] << 16;
-      uint64_t high = 0;
-      for (uint32_t byte = 0; byte < flagCost(tier); ++byte)
-        high |= uint64_t(inSlot ? slot[offset + byte] : *page.spill(offset + byte)) << (8 * byte);
-      offset += flagCost(tier);
-      for (uint32_t lane = 0; lane < 8; ++lane) {
-        const uint32_t dimension = group * 8 + lane;
-        const uint32_t value = (word >> (3 * lane)) & 7;
-        const uint32_t exponent = tier == 0   ? bases.base3[dimension] + value
-                                  : tier == 1 ? bases.base4[dimension] + (value | ((high >> lane) & 1) << 3)
-                                  : tier == 3 ? value | uint32_t((high >> (5 * lane)) & 31) << 3
-                                              : std::min<uint32_t>(bases.base3[dimension] + value, 254);
-        const uint32_t sm = data[row * kDims + dimension];
-        result[row * kDims + dimension] =
-            uint16_t(((sm & 0x80) << 8) | ((exponent & 0xFF) << 7) | (sm & 0x7F));
-      }
+  for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+      const uint8_t pair = data[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + dimension / 2];
+      const uint32_t code = dimension & 1 ? pair >> 4 : pair & 0xF;
+      const uint32_t exponent = (bases.base4[dimension] + code) & 0xFF;
+      const uint32_t sm = data[row * kDims + dimension];
+      result[row * kDims + dimension] = uint16_t(((sm & 0x80) << 8) | (exponent << 7) | (sm & 0x7F));
     }
-    if (inSlot) used = offset;
+  const uint32_t count = std::min(page.count(tensor, head), SPLASH_KVZIP_ESCAPES);
+  const uint32_t *escapes = page.escapes(tensor, head);
+  for (uint32_t index = 0; index < count; ++index) {
+    const uint32_t position = escapes[index] & 0xFFFF;
+    if (position / kDims < rows)
+      result[position] = uint16_t((result[position] & 0x807F) | (((escapes[index] >> 16) & 0xFF) << 7));
   }
   return result;
 }
-
 
 // The best 8- and 16-binade windows of one (tensor, KV head) from each
 // dimension's exponent histogram, as dev/tools/kvzip_calibrate.py fits them.
