@@ -16,8 +16,13 @@ constexpr uint8_t kQwen3_8_27b[] = {
 #include "model/kvzip/qwen3_8_27b.inc"
 };
 
+constexpr uint8_t kQwen3_6_35b_a3b[] = {
+#include "model/kvzip/qwen3_6_35b_a3b.inc"
+};
+
 constexpr std::array kCalibrations{
     Calibration{"Qwen3.8-27B", 16, 4, kQwen3_8_27b},
+    Calibration{"Qwen3.6-35B-A3B", 10, 2, kQwen3_6_35b_a3b},
 };
 
 } // namespace

@@ -196,8 +196,8 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
-  // ZBF16's KV codec (kv::PageStorage::codec()); empty for other formats.
-  metal::MetalBuffer kvCodec;
+  // ZBF16's codec and BF16 scratch; empty for other formats.
+  ops::KvZipPrefill kvZip;
   ops::MoeScratch moe;
 
   // The dense FFN's buffers among these.

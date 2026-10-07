@@ -86,9 +86,11 @@ PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset_kv2_g8, 2)
     constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                      \
     constexpr uint N = SplashKvPageTokens;                                     \
     constexpr uint D = SplashKvHeadDimension;                                  \
-    alignas(16) threadgroup float scores[M * N];                               \
+    static_assert(M * N * sizeof(float) <= N * D * sizeof(bfloat),             \
+                  "a page's scores fit the decoded tile they share");          \
     alignas(16) threadgroup bfloat probabilities[M * N];                       \
     alignas(16) threadgroup bfloat kv_tile[N * D];                             \
+    threadgroup uint slot_words[SPLASH_KVZIP_SLOT_BYTES / 4 + 2];                \
     threadgroup float row_max[M];                                              \
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
@@ -109,8 +111,8 @@ PAGED_VERIFY_ZIP_RESET(verify_attention_zip_reset_kv2_g8, 2)
         queries + (ulong(batch) * Heads + kv_head) * group_stride, page_table, \
         lane_params.kv, codec, kv_head, lane_params.committed_tokens,          \
         SPLASH_TARGET_VERIFY_ROWS, lane_params.split_count, split, partials,   \
-        statistics, slot, scores, probabilities, row_max, row_sum,             \
-        previous_scale, &rescale, kv_tile, partial, thread_index, simd_lane,   \
+        statistics, slot, probabilities, row_max, row_sum, previous_scale,     \
+        &rescale, kv_tile, partial, slot_words, thread_index, simd_lane,       \
         simd_group);                                                           \
   }
 PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split, 4, 6)

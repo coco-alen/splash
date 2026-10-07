@@ -50,6 +50,8 @@
 #include <stdint.h>
 #endif
 
+#include "metal/abi/PagedAttention.h"
+
 #define SPLASH_KVZIP_ROWS 32u
 #define SPLASH_KVZIP_DIMENSIONS 256u
 #define SPLASH_KVZIP_GROUP 8u
@@ -125,3 +127,19 @@ inline uint32_t splash_kvzip_flag_cost(uint32_t flags) {
 inline uint32_t splash_kvzip_spill_bytes(uint32_t layers, uint32_t kv_heads) {
   return layers * 2u * kv_heads * SPLASH_KVZIP_SHARE_BYTES;
 }
+
+// Prefill attends ZBF16 history through the BF16 kernels: before a chunk's
+// attention, its committed history is expanded into a BF16 scratch of one
+// layer, whose pages the scratch table names in logical order. chunk is the
+// store's parameters in the ZBF16 pool; scratch places the layer's region in
+// the scratch's single extent.
+struct SplashKvZipExpandParams {
+  SplashChunkedPrefillParams chunk;
+  SplashKvLayer scratch;
+};
+
+#ifndef __METAL_VERSION__
+static_assert(sizeof(SplashKvZipExpandParams) == 32,
+              "ZBF16 expand parameters are 32 bytes on both sides");
+#endif
+

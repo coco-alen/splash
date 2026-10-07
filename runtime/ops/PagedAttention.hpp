@@ -171,6 +171,17 @@ struct PagedVerifyBuffers final {
   metal::MetalBuffer kvCodec{};
 };
 
+// What ZBF16 prefill needs beside the BF16 path's buffers; empty for other
+// formats. Prefill attends ZBF16 history through the BF16 kernels: the store
+// expands the chunk's committed history into the scratch, a BF16 extent of
+// one layer, and writes the chunk's rows there as well; scratchTable names
+// its pages in logical order (kv::zipScratchPages()).
+struct KvZipPrefill final {
+  metal::MetalBuffer codec{};
+  metal::MetalBuffer scratch{};
+  metal::MetalBuffer scratchTable{};
+};
+
 // Target attention over paged INT8, BF16 or ZBF16 history. Prefill and verify both
 // read the history one Page32 at a time; neither changes cache ownership or
 // commit semantics.
@@ -242,7 +253,7 @@ public:
                               metal::MetalBuffer pageTable,
                               const kv::ChunkedPrefillParams &params,
                               kv::Layout layout,
-                              metal::MetalBuffer kvCodec = {});
+                              const KvZipPrefill &zip = {});
   // Queries and output are [KV head][row][query head in group][dimension] and
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
@@ -255,7 +266,7 @@ public:
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan,
-                         metal::MetalBuffer kvCodec = {});
+                         const KvZipPrefill &zip = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,

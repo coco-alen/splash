@@ -311,10 +311,10 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
         f32(b.ropeCos, geometry_.rotaryPairs), f32(b.ropeSin, geometry_.rotaryPairs), queries, keys, values,
         sequence.rows, sequence.attentionStride, geometry_.attentionQueryHeads, geometry_.kvLayout);
     ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values, sequence.pageTable,
-                                         sequence.chunk, geometry_.kvLayout, b.kvCodec);
+                                         sequence.chunk, geometry_.kvLayout, b.kvZip);
     ops::PagedAttention::addPrefill(
         step.graph, step.kvLayers[layer], queries, attentionRows, b.attentionPartials, b.attentionStatistics,
-        sequence.pageTable, sequence.chunk, step.attention[index], b.kvCodec);
+        sequence.pageTable, sequence.chunk, step.attention[index], b.kvZip);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16(b.fullPacked, geometry_.packedFullWidth), attentionRows,
         u16(b.attentionHidden, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,

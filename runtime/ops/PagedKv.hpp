@@ -223,4 +223,15 @@ struct Layout final {
   bool operator==(const Layout &) const = default;
 };
 
+// ZBF16 prefill's BF16 scratch (ops::KvZipPrefill): one layer's pages of the
+// longest physical context, an even count so its regions stay 64 KiB-aligned
+// as a BF16 extent's do.
+[[nodiscard]] constexpr uint32_t zipScratchPages() noexcept {
+  const uint32_t pages = (kMaximumPhysicalTokens + kPageTokens - 1) / kPageTokens;
+  return (pages + 1) / 2 * 2;
+}
+[[nodiscard]] constexpr Layout zipScratchLayout(Layout layout) noexcept {
+  return {1, layout.kvHeads, layout.headDimension, Format::BFloat16};
+}
+
 } // namespace splash::kv

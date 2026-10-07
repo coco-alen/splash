@@ -24,7 +24,8 @@ import re
 import numpy as np
 
 TOKENS, DIMENSIONS, GROUP = 32, 256, 8
-OVERFLOW_SLOT = 512
+SLOT_BYTES = 320  # a slab's overflow slot (runtime/metal/abi/KvZip.h)
+SHARE_BYTES = 128  # a slab's share of its page's spill pool
 REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
 
 
@@ -81,6 +82,9 @@ def main() -> None:
     print(f"{pages} pages ({pages * TOKENS} tokens) from {len(views)} file(s)")
     bases = np.zeros((args.layers, 2, args.kv_heads, 2, DIMENSIONS), np.uint8)
     worst = 0
+    # Per page, the overflow its slabs' slots do not hold, which the page's
+    # spill pool must (an upper bound: whole rows spill).
+    spilled = np.zeros(pages, np.int64)
     for layer in range(args.layers):
         for tensor in range(2):
             for head in range(args.kv_heads):
@@ -91,10 +95,12 @@ def main() -> None:
                 bases[layer, tensor, head] = base3, base4
                 overflow = slab_overflow(exponents, base3, base4)
                 worst = max(worst, int(overflow.max()))
-                if overflow.max() > OVERFLOW_SLOT:
-                    print(f"  layer {layer} {'KV'[tensor]} head {head}: "
-                          f"{int((overflow > OVERFLOW_SLOT).sum())} slabs exceed the overflow slot")
-    print(f"largest slab overflow {worst} of {OVERFLOW_SLOT} bytes")
+                spilled += np.maximum(overflow - SLOT_BYTES, 0)
+    capacity = args.layers * 2 * args.kv_heads * SHARE_BYTES - 4
+    print(f"largest slab overflow {worst} bytes ({SLOT_BYTES}-byte slots); pages that spill: "
+          f"{int((spilled > 0).sum())}, largest spill {int(spilled.max())} of {capacity} bytes")
+    if spilled.max() > capacity:
+        print(f"  {int((spilled > capacity).sum())} pages would exhaust their spill pool")
 
     slug = re.sub(r"[^0-9A-Za-z]+", "_", args.family).strip("_").lower()
     output = args.output or REPOSITORY / "runtime" / "model" / "kvzip" / f"{slug}.inc"
