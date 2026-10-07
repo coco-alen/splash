@@ -167,9 +167,11 @@ struct PagedVerifyBuffers final {
   metal::MetalBuffer statistics;
   metal::MetalBuffer output;
   std::span<const metal::MetalBuffer> pageTables;
+  // ZBF16's codec (kv::PageStorage::codec()); unused by other formats.
+  metal::MetalBuffer kvCodec{};
 };
 
-// Target attention over paged INT8 or BF16 history. Prefill and verify both
+// Target attention over paged INT8, BF16 or ZBF16 history. Prefill and verify both
 // read the history one Page32 at a time; neither changes cache ownership or
 // commit semantics.
 class PagedAttention final {
@@ -239,7 +241,8 @@ public:
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
                               const kv::ChunkedPrefillParams &params,
-                              kv::Layout layout);
+                              kv::Layout layout,
+                              metal::MetalBuffer kvCodec = {});
   // Queries and output are [KV head][row][query head in group][dimension] and
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
@@ -251,7 +254,8 @@ public:
                          metal::MetalBuffer statistics,
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
-                         const PrefillAttentionPlan &plan);
+                         const PrefillAttentionPlan &plan,
+                         metal::MetalBuffer kvCodec = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,

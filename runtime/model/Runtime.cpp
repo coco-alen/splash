@@ -1247,6 +1247,7 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers = prefillBuffers(*prefillArena);
+    buffers.kvCodec = kvPages.codec();
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1462,6 +1463,7 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    buffers.kvCodec = kvPages.codec();
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,

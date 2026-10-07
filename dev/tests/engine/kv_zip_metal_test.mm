@@ -1,0 +1,728 @@
+// ZBF16 KV pages (metal/abi/KvZip.h) against a host reference codec and the
+// BF16 kernels:
+//   - the prefill and verify stores write the bytes the host encoder writes,
+//     and every stored row decodes to the bits it came from;
+//   - a verify store over rejected speculative rows leaves the committed
+//     rows intact and decodes the new ones;
+//   - prefill and verify attention over ZBF16 pages give the BF16 kernels'
+//     output over the same values, bit for bit;
+//   - a slab whose overflow does not fit is counted, not written past.
+#include "TestBuffers.hpp"
+#include "TestChecks.hpp"
+#include "ops/PagedAttention.hpp"
+#include "tuning/HostKvExtents.hpp"
+#include "tuning/LinearNumerics.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace splash;
+using ops::tuning::HostKvExtents;
+using ops::tuning::bf16ToFloat;
+using ops::tuning::floatToBf16;
+using test::require;
+
+constexpr uint32_t kLayer = 1;
+constexpr uint32_t kRows = SPLASH_KVZIP_ROWS;
+constexpr uint32_t kDims = SPLASH_KVZIP_DIMENSIONS;
+
+// ---------------------------------------------------------------------------
+// Host reference codec (abi/KvZip.h).
+
+struct HeadBases final {
+  std::array<uint8_t, kDims> base3{};
+  std::array<uint8_t, kDims> base4{};
+};
+
+uint32_t flagCost(uint32_t flags) { return splash_kvzip_flag_cost(flags); }
+
+// One ZBF16 page of a host pool: its slabs in one layer and its spill pool
+// across every layer.
+struct ZipPage final {
+  const HostKvExtents &extents;
+  uint32_t layers, kvHeads, page, layer;
+
+  uint8_t *data(uint32_t tensor, uint32_t head) const {
+    return extents.slab<uint8_t>(layer, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS, page) +
+           head * SPLASH_KVZIP_DATA_BYTES_PER_HEAD;
+  }
+  uint8_t *aux(uint32_t tensor, uint32_t head) const {
+    return extents.slab<uint8_t>(layer, tensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, page) +
+           head * SPLASH_KVZIP_AUX_BYTES_PER_HEAD;
+  }
+  uint8_t *spill(uint32_t at) const {
+    const uint32_t share = at / SPLASH_KVZIP_SHARE_BYTES;
+    const uint32_t owner = share / (2 * kvHeads), tensor = share / kvHeads % 2, head = share % kvHeads;
+    return extents.slab<uint8_t>(owner, tensor ? SPLASH_KV_VALUE_SCALES : SPLASH_KV_KEY_SCALES, page) +
+           head * SPLASH_KVZIP_AUX_BYTES_PER_HEAD + SPLASH_KVZIP_SHARE_OFFSET + at % SPLASH_KVZIP_SHARE_BYTES;
+  }
+  uint32_t capacity() const { return splash_kvzip_spill_bytes(layers, kvHeads); }
+  uint32_t counter() const {
+    uint32_t value;
+    std::memcpy(&value, spill(0), 4);
+    return value;
+  }
+  void setCounter(uint32_t value) const { std::memcpy(spill(0), &value, 4); }
+};
+
+// One row's groups: tiers, code words and overflow bytes.
+struct RowCode final {
+  std::array<uint32_t, SPLASH_KVZIP_GROUPS_PER_ROW> tier{}, word{};
+  std::array<std::array<uint8_t, 5>, SPLASH_KVZIP_GROUPS_PER_ROW> bytes{};
+  uint32_t total = 0;
+};
+
+RowCode encodeRow(const uint16_t *row, const HeadBases &bases) {
+  RowCode code;
+  for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
+    bool all3 = true, all4 = true;
+    std::array<uint32_t, 8> exponent{};
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+      const uint32_t dimension = group * 8 + lane;
+      exponent[lane] = (row[dimension] >> 7) & 0xFF;
+      const int d3 = int(exponent[lane]) - bases.base3[dimension];
+      const int d4 = int(exponent[lane]) - bases.base4[dimension];
+      all3 &= d3 >= 0 && d3 < 8;
+      all4 &= d4 >= 0 && d4 < 16;
+    }
+    const uint32_t tier = all3 ? 0 : all4 ? 1 : 3;
+    uint32_t word = 0, window16 = 0;
+    uint64_t high = 0;
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+      const uint32_t dimension = group * 8 + lane;
+      const uint32_t value = tier == 0   ? exponent[lane] - bases.base3[dimension]
+                             : tier == 1 ? exponent[lane] - bases.base4[dimension]
+                                         : exponent[lane];
+      word |= (value & 7) << (3 * lane);
+      window16 |= ((value >> 3) & 1) << lane;
+      high |= uint64_t(exponent[lane] >> 3) << (5 * lane);
+    }
+    code.tier[group] = tier;
+    code.word[group] = word;
+    for (uint32_t byte = 0; byte < 5; ++byte)
+      code.bytes[group][byte] = tier == 1 ? (byte ? 0 : uint8_t(window16)) : uint8_t(high >> (8 * byte));
+    code.total += flagCost(tier);
+  }
+  return code;
+}
+
+// Stores rows [begin, end) of a slab as the store kernels do; `rows` holds
+// the page's 32 token-major rows. Returns whether a row lost groups.
+bool storeRows(const ZipPage &page, uint32_t tensor, uint32_t head, const uint16_t *rows, uint32_t begin,
+               uint32_t end, const HeadBases &bases) {
+  uint8_t *data = page.data(tensor, head), *aux = page.aux(tensor, head);
+  auto *flags = reinterpret_cast<uint32_t *>(aux);
+  auto *spill = reinterpret_cast<uint16_t *>(aux + SPLASH_KVZIP_SPILL_ROWS_OFFSET);
+  uint8_t *slot = aux + SPLASH_KVZIP_SLOT_OFFSET;
+  uint32_t used = 0;
+  for (uint32_t row = 0; row < begin; ++row)
+    if (spill[row] == SPLASH_KVZIP_IN_SLOT) used += flagCost(flags[2 * row]) + flagCost(flags[2 * row + 1]);
+  bool lostAny = false;
+  for (uint32_t row = begin; row < end; ++row) {
+    RowCode code = encodeRow(rows + row * kDims, bases);
+    uint32_t at = SPLASH_KVZIP_IN_SLOT;
+    bool lost = false;
+    if (code.total && used + code.total > SPLASH_KVZIP_SLOT_BYTES) {
+      at = page.counter();
+      page.setCounter(at + code.total);
+      lost = at + code.total > page.capacity();
+    }
+    lostAny |= lost;
+    std::array<uint32_t, 2> words{};
+    uint32_t offset = 0;
+    for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
+      uint32_t tier = code.tier[group];
+      if (lost && tier) tier = SPLASH_KVZIP_TIER_LOST;
+      const uint32_t word = tier == SPLASH_KVZIP_TIER_LOST ? 0 : code.word[group];
+      uint8_t *codes = data + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + group * 3;
+      codes[0] = uint8_t(word), codes[1] = uint8_t(word >> 8), codes[2] = uint8_t(word >> 16);
+      words[group / 16] |= tier << (2 * (group % 16));
+      for (uint32_t byte = 0; byte < flagCost(tier); ++byte) {
+        if (at == SPLASH_KVZIP_IN_SLOT) slot[used + offset + byte] = code.bytes[group][byte];
+        else *page.spill(at + offset + byte) = code.bytes[group][byte];
+      }
+      offset += flagCost(tier);
+    }
+    for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+      const uint32_t bits = rows[row * kDims + dimension];
+      data[row * kDims + dimension] = uint8_t(((bits >> 8) & 0x80) | (bits & 0x7F));
+    }
+    flags[2 * row] = words[0], flags[2 * row + 1] = words[1];
+    spill[row] = uint16_t(lost ? SPLASH_KVZIP_IN_SLOT : at);
+    if (at == SPLASH_KVZIP_IN_SLOT) used += code.total;
+  }
+  return lostAny;
+}
+
+// Decodes rows [0, rows) of a slab into BF16 bits, token-major; a lost group
+// decodes as the kernels decode it.
+std::vector<uint16_t> decodeSlab(const ZipPage &page, uint32_t tensor, uint32_t head, uint32_t rows,
+                                 const HeadBases &bases) {
+  const uint8_t *data = page.data(tensor, head), *aux = page.aux(tensor, head);
+  const auto *flags = reinterpret_cast<const uint32_t *>(aux);
+  const auto *spill = reinterpret_cast<const uint16_t *>(aux + SPLASH_KVZIP_SPILL_ROWS_OFFSET);
+  const uint8_t *slot = aux + SPLASH_KVZIP_SLOT_OFFSET;
+  std::vector<uint16_t> result(rows * kDims);
+  uint32_t used = 0;
+  for (uint32_t row = 0; row < rows; ++row) {
+    const bool inSlot = spill[row] == SPLASH_KVZIP_IN_SLOT;
+    uint32_t offset = inSlot ? used : spill[row];
+    for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
+      const uint32_t tier = (flags[2 * row + group / 16] >> (2 * (group % 16))) & 3;
+      const uint8_t *codes = data + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + group * 3;
+      const uint32_t word = codes[0] | codes[1] << 8 | codes[2] << 16;
+      uint64_t high = 0;
+      for (uint32_t byte = 0; byte < flagCost(tier); ++byte)
+        high |= uint64_t(inSlot ? slot[offset + byte] : *page.spill(offset + byte)) << (8 * byte);
+      offset += flagCost(tier);
+      for (uint32_t lane = 0; lane < 8; ++lane) {
+        const uint32_t dimension = group * 8 + lane;
+        const uint32_t value = (word >> (3 * lane)) & 7;
+        const uint32_t exponent = tier == 0   ? bases.base3[dimension] + value
+                                  : tier == 1 ? bases.base4[dimension] + (value | ((high >> lane) & 1) << 3)
+                                  : tier == 3 ? value | uint32_t((high >> (5 * lane)) & 31) << 3
+                                              : std::min<uint32_t>(bases.base3[dimension] + value, 254);
+        const uint32_t sm = data[row * kDims + dimension];
+        result[row * kDims + dimension] =
+            uint16_t(((sm & 0x80) << 8) | ((exponent & 0xFF) << 7) | (sm & 0x7F));
+      }
+    }
+    if (inSlot) used = offset;
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// KV-like test values: per (head, dimension) a Gaussian of its own scale, a
+// few outliers and exact zeros, so every tier occurs. Harsh values have ten
+// times the outliers, so rows spill.
+
+struct Values final {
+  // [tensor][head] token-major rows of the whole sequence.
+  std::array<std::vector<std::vector<uint16_t>>, 2> rows;
+  uint32_t tokens = 0;
+};
+
+// The scales are the "model's": the same for every seed, as one model's KV
+// serves every request.
+Values makeValues(uint32_t kvHeads, uint32_t tokens, uint32_t seed, bool harsh = false) {
+  std::mt19937 random(seed), model(1);
+  std::normal_distribution<float> normal;
+  std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+  const float outliers = harsh ? 0.008f : 0.0008f, zeros = harsh ? 0.002f : 0.0002f;
+  Values values;
+  values.tokens = tokens;
+  for (uint32_t tensor = 0; tensor < 2; ++tensor) {
+    values.rows[tensor].resize(kvHeads);
+    for (uint32_t head = 0; head < kvHeads; ++head) {
+      std::array<float, kDims> scale{};
+      for (float &value : scale) value = std::exp2(-6.0f + 8.0f * uniform(model));
+      auto &rows = values.rows[tensor][head];
+      rows.resize(uint64_t{tokens} * kDims);
+      for (uint32_t token = 0; token < tokens; ++token)
+        for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+          float value = normal(random) * scale[dimension];
+          const float pick = uniform(random);
+          if (pick < outliers) value *= 4096.0f;
+          else if (pick < outliers + zeros) value = 0.0f;
+          rows[uint64_t{token} * kDims + dimension] = floatToBf16(value);
+        }
+    }
+  }
+  return values;
+}
+
+// Best 8- and 16-binade windows of each (tensor, head, dimension), as
+// dev/tools/kvzip_calibrate.py fits them.
+std::array<std::vector<HeadBases>, 2> calibrate(const Values &values) {
+  std::array<std::vector<HeadBases>, 2> result;
+  for (uint32_t tensor = 0; tensor < 2; ++tensor)
+    for (const auto &rows : values.rows[tensor]) {
+      HeadBases bases;
+      for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+        std::array<uint32_t, 257> cumulative{};
+        for (uint32_t token = 0; token < values.tokens; ++token)
+          ++cumulative[((rows[uint64_t{token} * kDims + dimension] >> 7) & 0xFF) + 1];
+        for (uint32_t index = 1; index < 257; ++index) cumulative[index] += cumulative[index - 1];
+        for (uint32_t width : {8U, 16U}) {
+          uint32_t best = 0, base = 0;
+          for (uint32_t start = 0; start + width <= 256; ++start)
+            if (cumulative[start + width] - cumulative[start] > best)
+              best = cumulative[start + width] - cumulative[start], base = start;
+          (width == 8 ? bases.base3 : bases.base4)[dimension] = uint8_t(base);
+        }
+      }
+      result[tensor].push_back(bases);
+    }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Pages of `layers` attention layers in BF16 or ZBF16 (the layer under test
+// is kLayer), a sequence's page table and its staged rows.
+
+metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
+  auto buffer = test::sharedBuffer(backend, std::max<uint64_t>(bytes, 16));
+  std::memset(buffer.contents(), 0, buffer.sizeBytes());
+  return buffer;
+}
+
+struct Pool final {
+  kv::Layout layout;
+  HostKvExtents extents;
+  SplashKvLayer layer;
+  metal::MetalBuffer codec;
+  std::array<std::vector<HeadBases>, 2> bases;
+  uint32_t tested = kLayer;
+
+  ZipPage page(uint32_t id) const { return {extents, layout.attentionLayers, layout.kvHeads, id, tested}; }
+};
+
+// The layer under test is `tested`: kLayer, past layer 0's region, unless
+// the case needs layer 0's own store (which resets the spill pools).
+Pool makePool(metal::MetalBackend &backend, kv::Format format, uint32_t kvHeads, uint32_t pages,
+              const std::array<std::vector<HeadBases>, 2> &bases, uint32_t layers = 4,
+              uint32_t tested = kLayer) {
+  kv::Layout layout{layers, kvHeads, kDims, format};
+  const auto spread = HostKvExtents::spread(pages + 2);
+  Pool pool{layout, HostKvExtents(backend, layout, spread.extentPages, spread.extents), {}, {}, bases, tested};
+  pool.layer = pool.extents.layer(tested);
+  if (format == kv::Format::ZipBFloat16) {
+    pool.codec = allocate(backend, splash_kvzip_codec_bytes(layout.attentionLayers, kvHeads));
+    auto *bytes = static_cast<uint8_t *>(pool.codec.contents());
+    SplashKvZipHeader header{};
+    header.layers = layers;
+    header.kv_heads = kvHeads;
+    std::memcpy(bytes, &header, sizeof(header));
+    // Other layers' bases differ from the tested layer's, so a kernel that
+    // reads the wrong layer's decodes wrong bits.
+    for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
+      for (uint32_t tensor = 0; tensor < 2; ++tensor)
+        for (uint32_t head = 0; head < kvHeads; ++head) {
+          uint8_t *at = bytes + splash_kvzip_base_offset(kvHeads, layer, tensor, head);
+          for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+            at[dimension] = layer == tested ? bases[tensor][head].base3[dimension] : 1;
+            at[kDims + dimension] = layer == tested ? bases[tensor][head].base4[dimension] : 2;
+          }
+        }
+  }
+  return pool;
+}
+
+// Writes tokens [0, tokens) of a sequence into its pages, as committed
+// history: BF16 as it is, ZBF16 through the host store, each page's spill
+// pool reset first. Stale bytes fill the rest of every page, as a reused
+// page holds: any bytes for ZBF16, finite values for BF16 (a BF16 page's
+// stale rows are earlier KV, and its kernels weigh them by exact zeros).
+void writeHistory(Pool &pool, const std::vector<uint32_t> &pages, const Values &values, uint32_t tokens) {
+  for (uint32_t page = 0; page < pages.size(); ++page)
+    for (uint32_t layer = 0; layer < pool.layout.attentionLayers; ++layer)
+      for (uint32_t tensor = 0; tensor < 4; ++tensor) {
+        uint8_t *bytes = pool.extents.slab<uint8_t>(layer, tensor, pages[page]);
+        const uint64_t count = tensor % 2 ? pool.layout.scaleBytesPerLayerPage() : pool.layout.dataBytesPerLayerPage();
+        for (uint64_t byte = 0; byte < count; ++byte) bytes[byte] = uint8_t(byte * 131 + page * 7 + 0x5a);
+        if (pool.layout.format == kv::Format::BFloat16)
+          for (uint64_t byte = 1; byte < count; byte += 2) bytes[byte] = uint8_t(0x3C | (bytes[byte] & 0x80));
+      }
+  if (pool.layout.format == kv::Format::ZipBFloat16)
+    for (uint32_t page = 0; page * kRows < std::max(tokens, 1U) && page < pages.size(); ++page)
+      pool.page(pages[page]).setCounter(SPLASH_KVZIP_SPILL_START);
+  for (uint32_t tensor = 0; tensor < 2; ++tensor)
+    for (uint32_t head = 0; head < pool.layout.kvHeads; ++head) {
+      const auto &rows = values.rows[tensor][head];
+      for (uint32_t page = 0; page * kRows < tokens; ++page) {
+        const uint32_t count = std::min(kRows, tokens - page * kRows);
+        if (pool.layout.format == kv::Format::BFloat16) {
+          auto *slab = pool.extents.slab<uint16_t>(pool.tested, tensor ? SPLASH_KV_VALUES : SPLASH_KV_KEYS,
+                                                   pages[page]);
+          for (uint32_t row = 0; row < count; ++row)
+            for (uint32_t dimension = 0; dimension < kDims; ++dimension)
+              slab[tensor ? splash_kv_value_element(head, row, dimension)
+                          : splash_kv_key_element(head, row, dimension)] =
+                  rows[uint64_t{page * kRows + row} * kDims + dimension];
+        } else {
+          require(!storeRows(pool.page(pages[page]), tensor, head, rows.data() + uint64_t{page} * kRows * kDims,
+                             0, count, pool.bases[tensor][head]),
+                  "test history lost groups");
+        }
+      }
+    }
+}
+
+// Stages rows [first, first + count) of the values as a chunk of `stride`
+// rows: keys [head][row][dimension], values [head][dimension][row].
+void stage(const Values &values, uint32_t kvHeads, uint32_t first, uint32_t count, uint32_t stride,
+           uint16_t *keys, uint16_t *staged) {
+  for (uint32_t head = 0; head < kvHeads; ++head)
+    for (uint32_t row = 0; row < count; ++row)
+      for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+        const uint64_t source = uint64_t{first + row} * kDims + dimension;
+        keys[(uint64_t{head} * stride + row) * kDims + dimension] = values.rows[0][head][source];
+        staged[(uint64_t{head} * kDims + dimension) * stride + row] = values.rows[1][head][source];
+      }
+}
+
+// Every committed row of a ZBF16 sequence decodes to its value bits, and the
+// store wrote what the host store writes: sign/mantissa bytes, codes, flags,
+// which rows sit in the slot and the slot's bytes. Spilled rows' places in
+// the pool depend on the order the kernels took them in, so only their
+// decoded values are compared. Returns the rows that spilled.
+uint32_t requireDecodes(const Pool &pool, const std::vector<uint32_t> &pages, const Values &values,
+                        uint32_t tokens, const std::string &what) {
+  uint32_t spilled = 0;
+  for (uint32_t tensor = 0; tensor < 2; ++tensor)
+    for (uint32_t head = 0; head < pool.layout.kvHeads; ++head)
+      for (uint32_t page = 0; page * kRows < tokens; ++page) {
+        const uint32_t count = std::min(kRows, tokens - page * kRows);
+        const ZipPage zip = pool.page(pages[page]);
+        const uint16_t *expected = values.rows[tensor][head].data() + uint64_t{page} * kRows * kDims;
+        const auto decoded = decodeSlab(zip, tensor, head, count, pool.bases[tensor][head]);
+        const std::string where = what + " (tensor " + std::to_string(tensor) + ", head " +
+                                  std::to_string(head) + ", page " + std::to_string(page) + ")";
+        require(std::equal(decoded.begin(), decoded.end(), expected),
+                where + ": a stored row does not decode to its bits");
+        // The host store's bytes, on a copy of the slab's data and aux with
+        // a spill pool of its own.
+        std::vector<uint8_t> data(SPLASH_KVZIP_DATA_BYTES_PER_HEAD), aux(SPLASH_KVZIP_AUX_BYTES_PER_HEAD);
+        const uint8_t *actualData = zip.data(tensor, head), *actualAux = zip.aux(tensor, head);
+        const auto *actualSpill = reinterpret_cast<const uint16_t *>(actualAux + SPLASH_KVZIP_SPILL_ROWS_OFFSET);
+        uint32_t used = 0;
+        for (uint32_t row = 0; row < count; ++row) {
+          const RowCode code = encodeRow(expected + row * kDims, pool.bases[tensor][head]);
+          const bool inSlot = !code.total || used + code.total <= SPLASH_KVZIP_SLOT_BYTES;
+          require(inSlot == (actualSpill[row] == SPLASH_KVZIP_IN_SLOT),
+                  where + ": row " + std::to_string(row) + " is in the wrong place");
+          spilled += !inSlot;
+          std::array<uint32_t, 2> words{};
+          uint32_t offset = 0;
+          for (uint32_t group = 0; group < SPLASH_KVZIP_GROUPS_PER_ROW; ++group) {
+            words[group / 16] |= code.tier[group] << (2 * (group % 16));
+            const uint8_t *codes =
+                actualData + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + group * 3;
+            require(uint32_t(codes[0] | codes[1] << 8 | codes[2] << 16) == code.word[group],
+                    where + ": code words differ from the host store's");
+            if (inSlot)
+              for (uint32_t byte = 0; byte < flagCost(code.tier[group]); ++byte)
+                require(actualAux[SPLASH_KVZIP_SLOT_OFFSET + used + offset + byte] == code.bytes[group][byte],
+                        where + ": slot bytes differ from the host store's");
+            offset += flagCost(code.tier[group]);
+          }
+          require(std::memcmp(actualAux + row * 8, words.data(), 8) == 0,
+                  where + ": flags differ from the host store's");
+          for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+            const uint32_t bits = expected[row * kDims + dimension];
+            require(actualData[row * kDims + dimension] == uint8_t(((bits >> 8) & 0x80) | (bits & 0x7F)),
+                    where + ": sign/mantissa bytes differ from the host store's");
+          }
+          if (inSlot) used += code.total;
+        }
+      }
+  return spilled;
+}
+
+uint32_t overflowSlabs(const Pool &pool) {
+  uint32_t count = 0;
+  std::memcpy(&count, pool.codec.contents(), sizeof(count));
+  return count;
+}
+
+std::vector<uint32_t> distinctPages(const Pool &pool, uint32_t count, uint32_t seed) {
+  return HostKvExtents::mixedPages({pool.extents.extentPages(), pool.extents.extentCount()}, count, seed);
+}
+
+std::string compare(const std::vector<uint16_t> &left, const std::vector<uint16_t> &right) {
+  uint32_t different = 0;
+  float maximum = 0;
+  for (size_t index = 0; index < left.size(); ++index)
+    if (left[index] != right[index]) {
+      ++different;
+      maximum = std::max(maximum, std::abs(bf16ToFloat(left[index]) - bf16ToFloat(right[index])));
+    }
+  return different ? std::to_string(different) + " outputs differ (largest " + std::to_string(maximum) + ")"
+                   : std::string{};
+}
+
+// ---------------------------------------------------------------------------
+
+// Prefill store + attention of `rows` rows after `history` committed tokens,
+// in BF16 and in ZBF16 over the same values. The two outputs must be equal.
+void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t history, uint32_t rows,
+                  bool harsh = false) {
+  const uint32_t kvHeads = queryHeads == 24 ? 4 : 2;
+  const uint32_t tokens = history + rows, pageCount = (tokens + 31) / 32;
+  const Values values = makeValues(kvHeads, tokens, 7 + history + rows, harsh);
+  const auto bases = calibrate(makeValues(kvHeads, 4096, 999, harsh));
+  const uint32_t stride = (rows + 31) / 32 * 32;
+  auto keys = allocate(backend, uint64_t{kvHeads} * stride * kDims * 2);
+  auto staged = allocate(backend, keys.sizeBytes());
+  stage(values, kvHeads, history, rows, stride, static_cast<uint16_t *>(keys.contents()),
+        static_cast<uint16_t *>(staged.contents()));
+  auto queries = allocate(backend, uint64_t{queryHeads} * stride * kDims * 2);
+  std::mt19937 random(history * 31 + rows);
+  std::normal_distribution<float> normal;
+  for (uint64_t index = 0; index < uint64_t{queryHeads} * rows * kDims; ++index)
+    static_cast<uint16_t *>(queries.contents())[index] = floatToBf16(normal(random));
+
+  std::array<std::vector<uint16_t>, 2> outputs;
+  uint32_t spilled = 0;
+  for (const kv::Format format : {kv::Format::BFloat16, kv::Format::ZipBFloat16}) {
+    // Harsh values spill: a model's 16 layers give each page its spill pool.
+    Pool pool = makePool(backend, format, kvHeads, pageCount, bases, harsh ? 16 : 4);
+    const auto pages = distinctPages(pool, pageCount, tokens);
+    writeHistory(pool, pages, values, history);
+    auto table = allocate(backend, uint64_t{pageCount} * sizeof(SplashKvPage));
+    pool.extents.writeTable(pages, table.contents());
+    const auto chunk = ops::PagedAttention::prefillParams(history, rows, stride, pageCount);
+    const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, pool.layout);
+    auto output = allocate(backend, queries.sizeBytes());
+    auto partials = allocate(backend, plan.workspace.partialsBytes);
+    auto statistics = allocate(backend, plan.workspace.statisticsBytes);
+    // The layer under test is not layer 0, whose store resets the spill
+    // pools of the pages a command starts: layer 0's reset runs first.
+    metal::CommandGraph reset, graph;
+    std::vector<metal::ComputeDispatch> dispatches;
+    if (format == kv::Format::ZipBFloat16) {
+      ops::PagedAttention::addPrefillStore(reset, pool.extents.layer(0), keys, staged, table, chunk, pool.layout,
+                                          pool.codec);
+      require(reset.dispatches().size() == 2 &&
+                  reset.dispatches()[0].pipelineName.find("zip_reset") != std::string::npos,
+              "layer 0's ZBF16 prefill store should reset the spill pools first");
+      dispatches.push_back(reset.dispatches()[0]);
+    }
+    ops::PagedAttention::addPrefillStore(graph, pool.layer, keys, staged, table, chunk, pool.layout, pool.codec);
+    ops::PagedAttention::addPrefill(graph, pool.layer, queries, output, partials, statistics, table, chunk, plan,
+                                    pool.codec);
+    dispatches.insert(dispatches.end(), graph.dispatches().begin(), graph.dispatches().end());
+    (void)backend.submitCommandAsync(dispatches).wait();
+    if (format == kv::Format::ZipBFloat16) {
+      spilled = requireDecodes(pool, pages, values, tokens, "prefill store");
+      require(overflowSlabs(pool) == 0, "prefill store counted an overflow");
+    }
+    const auto *bits = static_cast<const uint16_t *>(output.contents());
+    outputs[format == kv::Format::ZipBFloat16] = {bits, bits + uint64_t{queryHeads} * rows * kDims};
+  }
+  const std::string difference = compare(outputs[0], outputs[1]);
+  require(difference.empty(), "ZBF16 prefill attention differs from BF16: " + difference);
+  require(!harsh || spilled, "harsh values did not spill");
+  std::cout << "zbf16 prefill: q=" << queryHeads << " history=" << history << " rows=" << rows
+            << (harsh ? " harsh" : "") << " spilled rows=" << spilled << " PASS (bit-equal to bf16)\n";
+}
+
+// Verify of `lanes` lanes at the given histories, twice: the second command
+// starts three rows into the first one's eight, as after a partial accept,
+// over new rows. Attention must equal BF16's at both, and every committed
+// row must decode.
+void checkVerify(metal::MetalBackend &backend, uint32_t queryHeads, std::array<uint32_t, 4> histories,
+                 uint32_t lanes) {
+  const uint32_t kvHeads = queryHeads == 24 ? 4 : 2;
+  constexpr uint32_t stride = kv::kVerifyChunkStride, rows = kv::kVerifyRows, accepted = 3;
+  std::array<Values, 4> first, second;
+  std::array<uint32_t, 4> pageCounts{};
+  uint32_t allPages = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const uint32_t tokens = histories[lane] + accepted + rows;
+    first[lane] = makeValues(kvHeads, tokens, 101 + lane);
+    second[lane] = first[lane];
+    // The second command's rows differ from the first's past the accepted ones.
+    const Values other = makeValues(kvHeads, tokens, 211 + lane);
+    for (uint32_t tensor = 0; tensor < 2; ++tensor)
+      for (uint32_t head = 0; head < kvHeads; ++head)
+        std::copy(other.rows[tensor][head].begin() + uint64_t{histories[lane] + accepted} * kDims,
+                  other.rows[tensor][head].end(),
+                  second[lane].rows[tensor][head].begin() + uint64_t{histories[lane] + accepted} * kDims);
+    pageCounts[lane] = (tokens + 31) / 32;
+    allPages += pageCounts[lane];
+  }
+  // One calibration serves every lane, as one model's bases serve every
+  // request.
+  const auto bases = calibrate(makeValues(kvHeads, 4096, 999));
+  std::array<std::array<std::vector<uint16_t>, 2>, 2> outputs;
+  for (const kv::Format format : {kv::Format::BFloat16, kv::Format::ZipBFloat16}) {
+    // The layer under test is layer 0, so the verify encodes its reset.
+    Pool pool = makePool(backend, format, kvHeads, allPages, bases, 4, 0);
+    Pool &host = pool;
+    const auto ids = distinctPages(pool, allPages, allPages + lanes);
+    std::array<std::vector<uint32_t>, 4> pages;
+    std::array<metal::MetalBuffer, 4> tables;
+    uint32_t next = 0;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      pages[lane].assign(ids.begin() + next, ids.begin() + next + pageCounts[lane]);
+      next += pageCounts[lane];
+      tables[lane] = allocate(backend, uint64_t{pageCounts[lane]} * sizeof(SplashKvPage));
+      pool.extents.writeTable(pages[lane], tables[lane].contents());
+      writeHistory(host, pages[lane], first[lane], histories[lane]);
+    }
+    for (uint32_t lane = lanes; lane < 4; ++lane) tables[lane] = tables[0];
+    auto keys = allocate(backend, uint64_t{lanes} * kvHeads * stride * kDims * 2);
+    auto staged = allocate(backend, keys.sizeBytes());
+    auto queries = allocate(backend, uint64_t{lanes} * queryHeads * stride * kDims * 2);
+    std::mt19937 random(lanes * 17 + queryHeads);
+    std::normal_distribution<float> normal;
+    for (uint64_t index = 0; index < queries.sizeBytes() / 2; ++index)
+      static_cast<uint16_t *>(queries.contents())[index] = floatToBf16(normal(random));
+    for (uint32_t step = 0; step < 2; ++step) {
+      std::array<kv::ChunkedPrefillParams, 4> chunks{};
+      std::array<uint32_t, 4> committed{};
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        committed[lane] = histories[lane] + (step ? accepted : 0);
+        const uint64_t laneRows = uint64_t{lane} * kvHeads * stride * kDims;
+        stage(step ? second[lane] : first[lane], kvHeads, committed[lane], rows, stride,
+              static_cast<uint16_t *>(keys.contents()) + laneRows,
+              static_cast<uint16_t *>(staged.contents()) + laneRows);
+        chunks[lane] = ops::PagedAttention::verifyParams(committed[lane], pageCounts[lane]);
+      }
+      const auto plan = ops::PagedAttention::verifyPlan(lanes, queryHeads, pool.layout,
+                                                        std::span(committed).first(lanes));
+      auto output = allocate(backend, queries.sizeBytes());
+      auto partials = allocate(backend, plan.workspace.partialsBytes);
+      auto statistics = allocate(backend, plan.workspace.statisticsBytes);
+      metal::CommandGraph graph;
+      ops::PagedAttention::addVerify(graph, pool.layer,
+                                     {keys, staged, queries, partials, statistics, output, tables, pool.codec},
+                                     std::span(chunks).first(lanes), plan);
+      require(graph.dispatches().size() == (format == kv::Format::ZipBFloat16 ? 4U : 3U),
+              "verify should encode reset (ZBF16, layer 0), store, split and reduce");
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+      const auto *bits = static_cast<const uint16_t *>(output.contents());
+      outputs[step][format == kv::Format::ZipBFloat16] = {bits, bits + output.sizeBytes() / 2};
+      if (format == kv::Format::ZipBFloat16) {
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+          (void)requireDecodes(pool, pages[lane], step ? second[lane] : first[lane], committed[lane] + rows,
+                               "verify store, step " + std::to_string(step) + ", lane " + std::to_string(lane));
+        require(overflowSlabs(pool) == 0, "verify store counted an overflow");
+      }
+    }
+  }
+  for (uint32_t step = 0; step < 2; ++step) {
+    const std::string difference = compare(outputs[step][0], outputs[step][1]);
+    require(difference.empty(), "ZBF16 verify attention differs from BF16 at step " + std::to_string(step) +
+                                    ": " + difference);
+  }
+  std::cout << "zbf16 verify: q=" << queryHeads << " lanes=" << lanes << " histories=" << histories[0]
+            << ".." << histories[lanes - 1] << " PASS (bit-equal to bf16, rejected rows rewritten)\n";
+}
+
+// Rows of uniformly random bits need ten times what slots and spill pool
+// hold: every slab is counted, the groups that did not fit decode finite and
+// the rows stored whole decode exactly; no byte past the page changes.
+void checkExhausted(metal::MetalBackend &backend) {
+  constexpr uint32_t kvHeads = 4, rows = 32;
+  Values values;
+  values.tokens = rows;
+  std::mt19937 random(5);
+  for (uint32_t tensor = 0; tensor < 2; ++tensor)
+    for (uint32_t head = 0; head < kvHeads; ++head) {
+      values.rows[tensor].emplace_back(rows * kDims);
+      for (auto &bits : values.rows[tensor].back()) bits = uint16_t(random());
+    }
+  std::array<std::vector<HeadBases>, 2> bases{std::vector<HeadBases>(kvHeads), std::vector<HeadBases>(kvHeads)};
+  Pool pool = makePool(backend, kv::Format::ZipBFloat16, kvHeads, 3, bases, 4, 0);
+  const auto pages = distinctPages(pool, 3, 9);
+  auto table = allocate(backend, 3 * sizeof(SplashKvPage));
+  pool.extents.writeTable(pages, table.contents());
+  // The neighbouring pages' bytes must not change.
+  std::vector<std::vector<uint8_t>> before;
+  for (uint32_t extent = 0; extent < pool.extents.extentCount(); ++extent) {
+    const auto bytes = pool.extents.bytes(extent);
+    before.emplace_back(reinterpret_cast<const uint8_t *>(bytes.data()),
+                        reinterpret_cast<const uint8_t *>(bytes.data()) + bytes.size());
+  }
+  auto keys = allocate(backend, uint64_t{kvHeads} * rows * kDims * 2);
+  auto staged = allocate(backend, keys.sizeBytes());
+  stage(values, kvHeads, 0, rows, rows, static_cast<uint16_t *>(keys.contents()),
+        static_cast<uint16_t *>(staged.contents()));
+  metal::CommandGraph graph;
+  ops::PagedAttention::addPrefillStore(graph, pool.layer, keys, staged, table,
+                                      ops::PagedAttention::prefillParams(0, rows, rows, 1), pool.layout, pool.codec);
+  require(graph.dispatches().size() == 2, "layer 0's prefill store should reset the spill pools first");
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  require(overflowSlabs(pool) == 2 * kvHeads, "every slab that lost groups must be counted once, got " +
+                                                  std::to_string(overflowSlabs(pool)));
+  const ZipPage zip = pool.page(pages[0]);
+  require(zip.counter() > zip.capacity(), "the spill pool was not exhausted");
+  uint32_t exact = 0;
+  for (uint32_t tensor = 0; tensor < 2; ++tensor)
+    for (uint32_t head = 0; head < kvHeads; ++head) {
+      const auto decoded = decodeSlab(zip, tensor, head, rows, bases[tensor][head]);
+      const auto *aux = zip.aux(tensor, head);
+      const auto *flags = reinterpret_cast<const uint32_t *>(aux);
+      for (uint32_t row = 0; row < rows; ++row) {
+        bool lost = false;
+        for (uint32_t word = 0; word < 2; ++word)
+          lost |= ((flags[2 * row + word] >> 1) & ~flags[2 * row + word] & 0x55555555u) != 0;
+        bool same = true;
+        for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+          const uint16_t bits = decoded[row * kDims + dimension];
+          require(((bits >> 7) & 0xFF) != 0xFF || ((values.rows[tensor][head][row * kDims + dimension] >> 7) & 0xFF) == 0xFF,
+                  "a lost group decoded to an infinity or NaN it did not hold");
+          same &= bits == values.rows[tensor][head][row * kDims + dimension];
+        }
+        require(lost || same, "a row stored whole does not decode to its bits");
+        exact += !lost;
+      }
+    }
+  for (uint32_t extent = 0; extent < pool.extents.extentCount(); ++extent) {
+    const auto bytes = pool.extents.bytes(extent);
+    const auto *after = reinterpret_cast<const uint8_t *>(bytes.data());
+    for (uint32_t page = 0; page < pool.extents.extentPages(); ++page) {
+      const uint32_t id = extent * pool.extents.extentPages() + page;
+      if (id == pages[0]) continue;
+      for (uint32_t layer = 0; layer < pool.layout.attentionLayers; ++layer)
+        for (uint32_t tensor = 0; tensor < 4; ++tensor) {
+          const uint64_t offset = pool.extents.slab<uint8_t>(layer, tensor, id) - after;
+          const uint64_t count = tensor % 2 ? pool.layout.scaleBytesPerLayerPage() : pool.layout.dataBytesPerLayerPage();
+          require(std::equal(after + offset, after + offset + count, before[extent].begin() + offset),
+                  "an exhausted store wrote outside its page");
+        }
+    }
+  }
+  std::cout << "zbf16 exhausted spill: " << overflowSlabs(pool) << " slabs counted, " << exact
+            << " whole rows exact, lost groups finite, other pages intact PASS\n";
+}
+
+void checkLayout() {
+  for (const uint32_t heads : {4U, 2U}) {
+    const kv::Layout zip{16, heads, 256, kv::Format::ZipBFloat16};
+    const kv::Layout bf16{16, heads, 256, kv::Format::BFloat16};
+    require(zip.valid() && zip.dataBytesPerLayerPage() == heads * 11264ull &&
+                zip.scaleBytesPerLayerPage() == heads * 768ull,
+            "ZBF16 page geometry changed");
+    require(zip.bytesPerModelPage() * 1000 / bf16.bytesPerModelPage() == 734,
+            "ZBF16 pages should be 0.734 of BF16's");
+    require(zip.extentAlignmentPages() == (heads == 4 ? 64U : 128U), "ZBF16 extent alignment changed");
+  }
+  require(!kv::Layout{16, 4, 128, kv::Format::ZipBFloat16}.valid(),
+          "ZBF16 accepted a head dimension its codec does not cover");
+  std::cout << "zbf16 layout: 0.734x of bf16 pages PASS\n";
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  try {
+    checkLayout();
+    if (argc < 2) return 0;
+    metal::MetalBackend backend(argv[1]);
+    checkExhausted(backend);
+    for (const uint32_t heads : {24U, 16U}) {
+      for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 6>{
+               {{0, 1}, {0, 64}, {13, 50}, {100, 77}, {1023, 257}, {4093, 1057}}})
+        checkPrefill(backend, heads, history, rows);
+      checkPrefill(backend, heads, 45, 300, true);
+      checkVerify(backend, heads, {0, 29, 31, 1000}, 4);
+      checkVerify(backend, heads, {4090, 0, 0, 0}, 1);
+    }
+    std::cout << "kv zip: PASS\n";
+  } catch (const std::exception &error) {
+    std::cerr << "kv zip: FAIL: " << error.what() << '\n';
+    return 1;
+  }
+}

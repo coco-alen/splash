@@ -198,8 +198,21 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
 BF16 avoids target KV quantization, uses approximately twice the target KV
 memory, and can be slower at long contexts. Model weights are unchanged. Restart
 to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
-The [SSD cache](#ssd-cache) supports both formats, preserving their stored
+The [SSD cache](#ssd-cache) supports every format, preserving their stored
 bytes without further quantization.
+
+`--kv-format zbf16` keeps BF16 KV bit for bit in 0.734 of its memory (1.47 MiB
+instead of 2 MiB per 27B page): each value's sign and mantissa as they are, and
+its exponent as a 3-bit code in a window that each (layer, KV head, dimension)
+calibrates per model family, with groups of eight values promoted to a
+16-binade window or raw exponents when they leave it (`runtime/metal/abi/KvZip.h`).
+The attention kernels decode each page into threadgroup memory and attend
+exactly as BF16 does; outputs match `--kv-format bf16` bit for bit. Only model
+families with a calibration start (Qwen3.8-27B); calibrate one from BF16 pages
+the persistent cache captured with `dev/tools/kvzip_calibrate.py`. A page whose
+promoted groups outgrow its slots and its spill pool, which real and repetitive
+prompts stay far from, loses those groups' exponents: `/status` counts its
+slabs as `identity.kv.overflow_slabs` and the server logs an error.
 
 ### SSD cache
 
