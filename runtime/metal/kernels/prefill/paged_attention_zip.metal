@@ -1,6 +1,6 @@
 #include "metal/kernels/common/paged_attention_zip_tile.h"
 
-// ZBF16 (abi/KvZip.h) prefill store, spill reset and history expansion.
+// ZBF16 (abi/KvZip.h) prefill store and history expansion.
 // Prefill attends through the BF16 split and reduce, over the BF16 scratch
 // the expansion fills.
 

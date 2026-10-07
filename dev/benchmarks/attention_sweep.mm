@@ -19,7 +19,7 @@
 //
 // --kv-sample fills BF16 and ZBF16 history with real KV pages a persistent
 // cache wrote for that shape's model (tuning/AttentionFixture.hpp KvSample),
-// so ZBF16 decodes groups of real tiers; INT8 keeps the synthetic history.
+// so ZBF16 decodes real escapes; INT8 keeps the synthetic history.
 //
 // The comparison library loads into a MetalBackend of its own, which needs
 // residency_kick (kernels/shared/residency.metal) in every library it loads:

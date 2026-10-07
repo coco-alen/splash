@@ -87,7 +87,7 @@ access.
 | `--no-webui` | Off | Disable the chat page. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
-| `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
+| `--kv-format` | `int8` | Target KV storage: `int8`, `bf16` or `zbf16` (BF16 compressed losslessly). See [KV cache precision](#kv-cache-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `0` (off) | SSD quota for cached KV pages and states, e.g. `16G`; kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts; needs `--max-cache-disk`. See [persistent cache](#persistent-cache). |
@@ -2200,7 +2200,15 @@ order, as the release check does ([Release check](#release-check)), and writes
 or a test of agent task quality.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
-report. Its cache checks reuse each context's cached prefix, so they need that
+report. Both take `--kv-format int8|bf16|zbf16`
+(`make benchmark-backend MODEL=... BACKEND_BENCHMARK_ARGS='--kv-format zbf16'`
+runs the tool with extra arguments); with `bf16`, whose startup runway spans
+more than one extent, the warmup timings are skipped. The attention sweep
+(`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--kv-format zbf16
+--kv-sample 27b=PATH'`) fills BF16 and ZBF16 history from real KV pages a
+persistent cache captured (`kv.slots` in its directory), so ZBF16 decodes the
+escapes real KV has; `--compare-metallib` checks a candidate's bits and times
+against another build's kernels. Its cache checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 

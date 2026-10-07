@@ -163,7 +163,7 @@ private:
     // ZBF16 overflowing slabs already logged (reportKvZipOverflow).
     uint32_t kvZipOverflowLogged_ = 0;
 
-    // Logs ZBF16 slabs whose overflow did not fit since the last pass.
+    // Logs ZBF16 slabs that dropped escapes since the last pass.
     void reportKvZipOverflow();
 };
 

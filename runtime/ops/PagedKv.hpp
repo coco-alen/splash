@@ -119,7 +119,7 @@ namespace detail {
 } // namespace detail
 
 // Physical KV geometry: Page32, either BF16, per-(token, head) symmetric INT8
-// or lossless ZBF16, whose flags and overflow take the scales' region.
+// or lossless ZBF16, whose escapes take the scales' region.
 // Layer and head counts vary by target.
 struct Layout final {
   uint32_t attentionLayers = 0;

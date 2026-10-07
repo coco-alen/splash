@@ -652,8 +652,9 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
 
+# BACKEND_BENCHMARK_ARGS passes --kv-format/--scenario/--samples/--max-context.
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
-	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"
+	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" $(BACKEND_BENCHMARK_ARGS)
 
 # CPU tests that also run under the sanitizers: each is built three times
 # from the same sources, once as the CPU tests above are and once under each
