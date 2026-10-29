@@ -128,7 +128,9 @@ Boundaries:
   (`PrefillTensor::ZipScratch`) and writes the chunk's rows there as well, one
   bandwidth pass per layer and chunk (27B: 0.9 ms at 32K, 3.8 ms at 128K).
 - Verify decodes each page into a 16 KiB threadgroup tile, token-major, and
-  runs the BF16 loop's MPP products and softmax over it, bit for bit.
+  runs the BF16 loop's MPP products and softmax over it, bit for bit. On the
+  27B's shape the scores have their own scratch, so a page's values decode in
+  its softmax's phase: four barriers a page instead of six.
 - A slab with more escapes than its table stores the rest with code 0 (never
   an infinity or NaN); the store counts it, `/status` reports
   `identity.kv.overflow_slabs` and the server logs an error. Real KV needs 0.8
@@ -147,7 +149,11 @@ Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
   of BF16's.
 - `attention-sweep --kv-sample` on captured KV, per layer at 128K history,
   one lane: verify 27B 3.06 ms (BF16 2.71), 35B 1.79 ms (BF16 1.54); at
-  32K 0.85 (0.76) and 0.53 (0.44). The BF16 verify kernel runs within ~25%
+  32K 0.85 (0.76) and 0.53 (0.44). With the 27B's values decoding beside its
+  softmax (2026-10-28, 38K captured tokens of code and prose each): 27B 2.87
+  ms at 128K (BF16 2.70) and 11.20 at four lanes (10.34), 0.81 at 32K
+  (0.77), 0.097 at 2K (0.084); the 35B, whose 8 KiB of scores cost its short
+  contexts more than the barrier saves, keeps sharing the tile. The BF16 verify kernel runs within ~25%
   of its compute floor under 8-row speculative verify, so a decoded page's
   wait for its own bytes costs more than the 19% fewer bytes save: lossless
   pages give capacity (23% more context), not a decode speedup, on this GPU.
@@ -162,3 +168,16 @@ will serve, stop it cleanly and run `dev/tools/kvzip_calibrate.py` on the
 directory's `kv.slots`; the earlier calibration (NPLG, 3-bit codes in groups
 promoted to 16-binade or raw tiers, 0.734 of BF16's bytes) decoded 1.8x
 slower than BF16 and is in this branch's history.
+
+## Lossless INT8 (2026-10-28): not worth a format
+
+INT8 codes computed exactly as the store writes them (per-token absmax / 127)
+from the same captured BF16 KV hold 6.85-7.0 bits each (order-0 entropy), and
+6.4-6.75 bits per (layer, KV head, dimension); deltas along tokens hold no
+less. The best fixed-width codings a kernel could decode keep 0.93-0.98 of
+INT8's bytes: groups of 16 at 5-8 bits with a 2-bit tag, or a calibrated
+width per dimension with escapes (27B K 0.953, V 0.983; 35B K 0.934, V
+0.956). ZBF16's verify spends about 6% over BF16 on decoding through
+threadgroup memory, which INT8's MPP products, reading device memory
+directly, do not pay; at most 7% fewer bytes cannot buy that back.
+
