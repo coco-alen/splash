@@ -178,6 +178,21 @@ Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
   Outputs are unchanged: every digest equals BF16's and the earlier
   layout's, and greedy outputs of the 27B (a short prompt, and 34K tokens
   of code) equal BF16's token for token.
+- The 35B's verify (eight query heads per KV head, 64 rows a tile) stays
+  4-7% behind BF16 at 32K-128K. Its kernel, probed at 128K: products,
+  softmax and barriers over the tile 0.94 ms, slab loads and tile writes
+  0.46, decode arithmetic 0.16. Three kernels tailored to the shape lost or
+  tied (ABBA, captured KV): scores apart from the tile (-5 to -8% at 2K,
+  +6% at 32K: its 8 KiB leaves two threadgroups a core instead of three);
+  a pipelined loop over two 8 KiB half tiles that decodes each half beside
+  a product (+26-30%: half-width MPP products cost more than the barriers
+  they hide); and loading a page's values with its keys (within 3%: the
+  registers cost the occupancy the early loads save). End to end the gap
+  does not show: `backend-benchmark --scenario decode,context --max-context
+  65536` on the 35B decodes 64 tokens in 267 ms of GPU time (BF16 271) and
+  answers after 2K, 10K and 50K tokens of context in 426, 457 and 469 ms
+  (BF16 442, 458, 472), with the same output tokens; prefill and cached
+  continuations within noise.
 - INT8 and BF16 unchanged: every attention kernel's bits and times match the
   upstream metallib (36 cases), and the ABBA regression against upstream
   (`test-performance-real` with `BASELINE`, idle, ANE split off on both)
