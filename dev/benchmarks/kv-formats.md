@@ -181,3 +181,37 @@ width per dimension with escapes (27B K 0.953, V 0.983; 35B K 0.934, V
 threadgroup memory, which INT8's MPP products, reading device memory
 directly, do not pay; at most 7% fewer bytes cannot buy that back.
 
+## GAAC-style register decode of ZBF16 values (2026-10-28, experiment)
+
+This branch (`exp/zbf16-gaac-registers`) decodes each page's values straight
+into PV's right-input cooperative tensor, as GAAC decodes into its MMA
+operands: PV runs per simdgroup over its own 32 output dimensions
+(`execution_simdgroup`, which input cooperative tensors require; their
+operand layouts need a deployment target of 26.2 or later, else they fall back
+to the destination's), the values need no threadgroup tile, and a page takes
+three barriers, as BF16's. On Apple10 a lane's 32 elements are four
+consecutive dimensions of one token in eight groups, so each group decodes
+as the tile decode's words do. Outputs stay bit for bit BF16's (`kv-zip`).
+Writing the cooperative tensor's elements through a helper's reference
+miscompiled; decoding into a local array and assigning inline does not.
+
+Verify per layer on captured KV, M5 Pro 16, ms (main ZBF16: values through
+the tile, four barriers on the 27B):
+
+| | 27B 32K | 27B 128K | 27B 128K x4 | 35B 32K | 35B 128K | 35B 128K x4 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| main ZBF16 | 0.82 | 2.92 | 11.22 | 0.52 | 1.76 | 6.80 |
+| tile decode, per-simdgroup PV | 0.82 | 3.01 | | | | |
+| register decode, element loads | 1.44 | 5.23 | 20.67 | 0.88 | 2.97 | 11.50 |
+| register decode, batched word loads | 0.97 | 3.40 | 12.93 | 0.81 | 2.82 | 10.80 |
+| bound: three contiguous loads a lane | 0.87 | 3.14 | 11.88 | 0.61 | 2.40 | 8.83 |
+
+The last row times a fragment-order page layout (GAAC stores its pages so)
+with the decode's arithmetic on unrelated bytes: even it stays 7% (27B) and
+36% (35B) slower than decoding through the tile. A per-simdgroup PV over
+cooperative inputs costs ~4% by itself here, and the decode's registers
+beside PV's accumulator (48 floats a lane for the 27B, 64 for the 35B) cost
+the rest. GAAC gains on single-token decode (M <= 8) on NVIDIA's MMA
+fragments; Splash verifies 48-64 rows, and Apple10's 8-simdgroup MPP over a
+staged tile reads it faster. Not pursued.
+

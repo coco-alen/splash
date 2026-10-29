@@ -19,6 +19,108 @@
 // within 1% on the 35B's eight, whose 8 KiB of scores cost the short
 // contexts more. Threadgroup scratch beyond the BF16 loop's probabilities
 // and statistics: the 16 KiB tile, and the scores with OwnScores.
+// A lane's share of PV's right input in a simdgroup's 32 dimensions, the
+// cooperative tensor's elements in groups of four: where each group holds
+// four consecutive dimensions of one token (Apple10 lays the right input out
+// so), the group's token, first dimension and those dimensions' bases,
+// found once per tile; otherwise `words` is false and the values decode one
+// element at a time.
+struct SplashKvZipValueLane {
+  static constexpr constant uint Groups = 8;
+  ushort token[Groups];
+  ushort dimension[Groups];
+  uint base[Groups];
+  bool words;
+};
+
+template <class Values>
+inline SplashKvZipValueLane splash_kvzip_value_lane(thread const Values &values, uint first,
+                                                    device const uchar *bases) {
+  SplashKvZipValueLane lane;
+  lane.words = values.get_capacity() == 4 * SplashKvZipValueLane::Groups;
+  for (ushort group = 0; group < SplashKvZipValueLane::Groups; ++group) {
+    const auto at = values.get_multidimensional_index(ushort(4 * group));
+    lane.token[group] = ushort(at[1]);
+    lane.dimension[group] = ushort(first + uint(at[0]));
+    lane.words = lane.words && (lane.dimension[group] & 3u) == 0;
+    for (ushort next = 1; next < 4; ++next) {
+      const auto later = values.get_multidimensional_index(ushort(4 * group + next));
+      lane.words = lane.words && ushort(later[1]) == lane.token[group] &&
+                   first + uint(later[0]) == uint(lane.dimension[group]) + next;
+    }
+    lane.base[group] = lane.words ? *reinterpret_cast<device const uint *>(bases + lane.dimension[group]) : 0u;
+  }
+  return lane;
+}
+
+// Decodes a simdgroup's share of PV's right input from the slab's bytes into
+// `decoded`, BF16 bits in the cooperative tensor's element order, straight
+// into the registers the product reads, as GAAC decodes into its MMA
+// operands: no threadgroup tile and no barrier. Each group of four decodes
+// as the tile decode's words do, from one word of sign/mantissa bytes and two
+// bytes of codes, every group's bytes loaded before the first decodes.
+// Tokens past `rows` decode to zeros, as the tile's decode writes them.
+template <class Values>
+inline void splash_kvzip_fill_values(thread const Values &values, thread const SplashKvZipValueLane &lane,
+                                     thread ushort *decoded, SplashKvZipSlab slab, uint rows, uint first,
+                                     device const uchar *bases) {
+  constexpr uint D = SPLASH_KVZIP_DIMENSIONS;
+  constexpr uint G = SplashKvZipValueLane::Groups;
+  const uint count = min(*slab.count, SPLASH_KVZIP_ESCAPES);
+  if (lane.words) {
+    uint sm[G], nibbles[G];
+#pragma unroll
+    for (uint group = 0; group < G; ++group) {
+      const uint token = min(uint(lane.token[group]), rows - 1u), dimension = lane.dimension[group];
+      sm[group] = *reinterpret_cast<device const uint *>(slab.data + token * D + dimension);
+      nibbles[group] = *reinterpret_cast<device const ushort *>(
+          slab.data + SPLASH_KVZIP_SM_BYTES + token * SPLASH_KVZIP_CODE_BYTES_PER_ROW + dimension / 2u);
+    }
+#pragma unroll
+    for (uint group = 0; group < G; ++group) {
+      const uint n = nibbles[group];
+      const uint code4 = (n & 0xFu) | ((n & 0xF0u) << 4) | ((n & 0xF00u) << 8) | ((n & 0xF000u) << 12);
+      const uint2 packed = lane.token[group] < rows ? splash_kvzip_pack4(sm[group], lane.base[group] + code4)
+                                                    : uint2(0);
+      decoded[4 * group] = ushort(packed.x);
+      decoded[4 * group + 1] = ushort(packed.x >> 16);
+      decoded[4 * group + 2] = ushort(packed.y);
+      decoded[4 * group + 3] = ushort(packed.y >> 16);
+    }
+    for (uint escape = 0; escape < count; ++escape) {
+      const uint entry = slab.escapes[escape], position = entry & 0xFFFFu;
+      const uint token = position / D, dimension = position % D;
+      if (token >= rows)
+        continue;
+#pragma unroll
+      for (uint group = 0; group < G; ++group) {
+        const uint offset = dimension - lane.dimension[group];
+        if (token == lane.token[group] && offset < 4u)
+          decoded[4 * group + offset] = ushort((decoded[4 * group + offset] & ~0x7F80u) | (((entry >> 16) & 0xFFu) << 7));
+      }
+    }
+    return;
+  }
+  for (ushort element = 0; element < values.get_capacity(); ++element) {
+    const auto here = values.get_multidimensional_index(element);
+    const uint d = first + uint(here[0]), t = uint(here[1]);
+    uint bits = 0;
+    if (t < rows) {
+      const uint sm = slab.data[t * D + d];
+      const uint code = (slab.data[SPLASH_KVZIP_SM_BYTES + t * SPLASH_KVZIP_CODE_BYTES_PER_ROW + d / 2u] >>
+                         (4u * (d & 1u))) & 0xFu;
+      uint exponent = bases[d] + code;
+      for (uint escape = 0; escape < count; ++escape) {
+        const uint entry = slab.escapes[escape];
+        if ((entry & 0xFFFFu) == t * D + d)
+          exponent = (entry >> 16) & 0xFFu;
+      }
+      bits = ((sm & 0x80u) << 8) | (exponent << 7) | (sm & 0x7Fu);
+    }
+    decoded[element] = ushort(bits);
+  }
+}
+
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, bool OwnScores>
 inline void splash_paged_attention_zip_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
@@ -50,28 +152,31 @@ inline void splash_paged_attention_zip_tile(
   auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto kt = tensor(kv_tile, dextents<int, 2>{D, N}, array<int, 2>{1, D});
-  auto vt = tensor(kv_tile, dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto p0 = pt.slice<N, M>(0, 0);
   auto q0 = qt.slice<D, M>(0, 0);
   auto k0 = kt.slice<D, N>(0, 0);
-  auto v0 = vt.slice<D, N>(0, 0);
   const SplashKvZipAddressing<KVHeads> addressing(kv);
   const SplashKvZipLaneBases key_bases =
       splash_kvzip_lane_bases(addressing.bases(codec, kv_head, false), thread_index);
-  const SplashKvZipLaneBases value_bases =
-      splash_kvzip_lane_bases(addressing.bases(codec, kv_head, true), thread_index);
+  device const uchar *value_bases = addressing.bases(codec, kv_head, true);
+  // PV runs per simdgroup over its own 32 output dimensions, whose values it
+  // decodes into the product's right input (splash_kvzip_fill_values).
+  constexpr ushort Columns = D / 8;
+  const uint simd_group = thread_index / 32u;
   constexpr auto qk_descriptor =
       matmul2d_descriptor(M, N, D, false, true, false,
                           matmul2d_descriptor::mode::multiply);
   constexpr auto pv_descriptor =
-      matmul2d_descriptor(M, D, N, false, false, true,
+      matmul2d_descriptor(M, Columns, N, false, false, true,
                           matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
-  matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
+  matmul2d<pv_descriptor, execution_simdgroup> pv;
+  auto page_values = pv.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
   auto running = pv.template get_destination_cooperative_tensor<
-      decltype(p0), decltype(v0), float>();
-  const bool running_full =
-      uint(running.get_capacity()) * (8u * 32u) == uint(M) * D;
+      decltype(p0), decltype(page_values), float>();
+  const SplashKvZipValueLane value_lane =
+      splash_kvzip_value_lane(page_values, simd_group * Columns, value_bases);
+  const bool running_full = uint(running.get_capacity()) * 32u == uint(M) * Columns;
 #pragma unroll
   for (ushort index = 0; index < running.get_capacity(); ++index) {
     if (running_full || running.is_valid_element(index))
@@ -102,13 +207,18 @@ inline void splash_paged_attention_zip_tile(
         scores, probabilities, row_max, row_sum, previous_scale, rescale, nullptr,
         nullptr, token_start, visible_tokens, committed_tokens, active_rows,
         thread_index);
-    // The products read the keys before the barrier ahead of the softmax; the
-    // decode's closing barrier also ends the softmax. Shared, the scores are
-    // read before the values overwrite them.
-    if (!OwnScores)
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_kvzip_decode_slab(splash_kvzip_load(values, rows, thread_index), values, value_bases,
-                             false, bits, thread_index);
+    {
+      ushort decoded[Columns * N / 32];
+      splash_kvzip_fill_values(page_values, value_lane, decoded, values, rows, simd_group * Columns,
+                               value_bases);
+#pragma unroll
+      for (ushort i = 0; i < page_values.get_capacity(); ++i)
+        page_values[i] = as_type<bfloat>(decoded[i]);
+    }
+    // The softmax's probabilities and scales, before the products read them.
+    // The next page's keys overwrite the tile after its decode's barrier, so
+    // the products need none after them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
       for (ushort index = 0; index < running.get_capacity(); ++index) {
@@ -118,12 +228,11 @@ inline void splash_paged_attention_zip_tile(
         running[index] *= previous_scale[coordinates[1]];
       }
     }
-    pv.run(p0, v0, running);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    pv.run(p0, page_values, running);
   }
   auto target = tensor(partials + slot * M * D, dextents<int, 2>{D, M},
                        array<int, 2>{1, D});
-  running.store(target.slice<D, M>(0, 0));
+  running.store(target.slice<Columns, M>(simd_group * Columns, 0));
   if (thread_index < M) {
     statistics[(slot * M + thread_index) * 2] = row_max[thread_index];
     statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
