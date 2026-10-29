@@ -44,7 +44,7 @@ PAGED_VERIFY_ZIP_STORE(verify_attention_zip_store_kv2_g8, 2)
 #undef PAGED_VERIFY_ZIP_STORE
 
 // Split: the BF16 verify split's grid and slots over decoded pages.
-#define PAGED_VERIFY_ZIP_SPLIT(Name, Heads, Group)                             \
+#define PAGED_VERIFY_ZIP_SPLIT(Name, Heads, Group, OwnScores)                  \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -60,8 +60,9 @@ PAGED_VERIFY_ZIP_STORE(verify_attention_zip_store_kv2_g8, 2)
     constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                      \
     constexpr uint N = SplashKvPageTokens;                                     \
     constexpr uint D = SplashKvHeadDimension;                                  \
-    static_assert(M * N * sizeof(float) <= N * D * sizeof(bfloat),             \
-                  "a page's scores fit the decoded tile they share");          \
+    static_assert(OwnScores || M * N * sizeof(float) <= N * D * sizeof(bfloat), \
+                  "shared scores fit the decoded tile");                       \
+    alignas(16) threadgroup float scores[OwnScores ? M * N : 1];               \
     alignas(16) threadgroup bfloat probabilities[M * N];                       \
     alignas(16) threadgroup bfloat kv_tile[N * D];                             \
     threadgroup float row_max[M];                                              \
@@ -79,13 +80,15 @@ PAGED_VERIFY_ZIP_STORE(verify_attention_zip_store_kv2_g8, 2)
         batch, page_table0, page_table1, page_table2, page_table3);            \
     const ulong slot =                                                         \
         (ulong(batch) * Heads + kv_head) * lane_params.slot_splits + split;    \
-    splash_paged_attention_zip_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS>(  \
+    splash_paged_attention_zip_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,   \
+                                    OwnScores>(                                \
         queries + (ulong(batch) * Heads + kv_head) * group_stride, page_table, \
         lane_params.kv, codec, kv_head, lane_params.committed_tokens,          \
         SPLASH_TARGET_VERIFY_ROWS, lane_params.split_count, split, partials,   \
-        statistics, slot, probabilities, row_max, row_sum, previous_scale,     \
+        statistics, slot, scores, probabilities, row_max, row_sum,             \
+        previous_scale,                                                        \
         &rescale, kv_tile, thread_index);                                      \
   }
-PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split, 4, 6)
-PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split_kv2_g8, 2, 8)
+PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split, 4, 6, true)
+PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split_kv2_g8, 2, 8, false)
 #undef PAGED_VERIFY_ZIP_SPLIT

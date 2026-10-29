@@ -9,22 +9,29 @@
 // partials; each page's keys, then its values, are first decoded into one
 // BF16 threadgroup tile, token-major, so a ZBF16 page attends exactly as the
 // BF16 page it decodes to (PV reads the values untransposed, bit for bit as
-// the BF16 loop's transposed read). The page's scores share the tile: they
-// are written after the keys' last read and read before the values' first
-// write. Threadgroup scratch beyond the BF16 loop's probabilities and
-// statistics: the 16 KiB tile.
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile>
+// the BF16 loop's transposed read). With OwnScores the page's scores have
+// their own scratch, as the BF16 loop's do, so a page's values decode beside
+// its softmax, which touches neither: a page takes four barriers, after its
+// keys' decode, before its softmax, after its values' decode and after its
+// products. Without it the scores share the tile, written after the keys'
+// last read and read before the values' first write, at two barriers more:
+// 6% faster on the 27B's six query heads per KV head (M5 Pro, 2K-128K),
+// within 1% on the 35B's eight, whose 8 KiB of scores cost the short
+// contexts more. Threadgroup scratch beyond the BF16 loop's probabilities
+// and statistics: the 16 KiB tile, and the scores with OwnScores.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, bool OwnScores>
 inline void splash_paged_attention_zip_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, device const uchar *codec, uint kv_head, uint committed_tokens,
     uint active_rows, uint splits, uint split, device float *partials,
-    device float *statistics, ulong slot, threadgroup bfloat *probabilities,
+    device float *statistics, ulong slot, threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, threadgroup bfloat *kv_tile, uint thread_index) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashKvPageTokens;
   constexpr ushort D = SplashKvHeadDimension;
-  threadgroup float *scores = reinterpret_cast<threadgroup float *>(kv_tile);
+  if (!OwnScores)
+    scores = reinterpret_cast<threadgroup float *>(kv_tile);
   threadgroup ushort *bits = reinterpret_cast<threadgroup ushort *>(kv_tile);
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
@@ -85,7 +92,8 @@ inline void splash_paged_attention_zip_tile(
         decltype(q0), decltype(k0), float>();
     qk.run(q0, k0, page_scores);
     // Every simdgroup has read the keys before the scores overwrite them.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!OwnScores)
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     page_scores.store(st.slice<N, M>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
@@ -94,8 +102,11 @@ inline void splash_paged_attention_zip_tile(
         scores, probabilities, row_max, row_sum, previous_scale, rescale, nullptr,
         nullptr, token_start, visible_tokens, committed_tokens, active_rows,
         thread_index);
-    // The scores are read before the values overwrite them.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The products read the keys before the barrier ahead of the softmax; the
+    // decode's closing barrier also ends the softmax. Shared, the scores are
+    // read before the values overwrite them.
+    if (!OwnScores)
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     splash_kvzip_decode_slab(splash_kvzip_load(values, rows, thread_index), values, value_bases,
                              false, bits, thread_index);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
