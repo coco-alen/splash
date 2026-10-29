@@ -68,6 +68,20 @@ inline RowCode encodeRow(const uint16_t *row, uint32_t rowIndex, const HeadBases
   return code;
 }
 
+// Writes a row's sign/mantissa bytes and codes into a slab's data, in the
+// page layout (abi/KvZip.h, splash_kvzip_sm_byte and splash_kvzip_code_bit).
+inline void writeRow(uint8_t *data, uint32_t row, const uint16_t *bits, const RowCode &code) {
+  uint8_t *codes = data + SPLASH_KVZIP_SM_BYTES;
+  for (uint32_t byte = 0; byte < SPLASH_KVZIP_CODE_BYTES_PER_ROW; ++byte)
+    codes[row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + byte] = 0;
+  for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+    data[splash_kvzip_sm_byte(row, dimension)] =
+        uint8_t(((bits[dimension] >> 8) & 0x80) | (bits[dimension] & 0x7F));
+    const uint32_t bit = splash_kvzip_code_bit(row, dimension);
+    codes[bit / 8] = uint8_t(codes[bit / 8] | (code.code[dimension] << (bit % 8)));
+  }
+}
+
 // Stores rows [begin, end) of a slab as the store kernels do; `rows` holds
 // the page's 32 token-major rows. Rows before `begin` keep their escapes.
 // Returns whether an escape was dropped.
@@ -87,13 +101,7 @@ inline bool storeRows(const ZipPage &page, uint32_t tensor, uint32_t head, const
   bool dropped = false;
   for (uint32_t row = begin; row < end; ++row) {
     const RowCode code = encodeRow(rows + row * kDims, row, bases);
-    for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
-      const uint32_t bits = rows[row * kDims + dimension];
-      data[row * kDims + dimension] = uint8_t(((bits >> 8) & 0x80) | (bits & 0x7F));
-    }
-    for (uint32_t pair = 0; pair < kDims / 2; ++pair)
-      data[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + pair] =
-          uint8_t(code.code[2 * pair] | (code.code[2 * pair + 1] << 4));
+    writeRow(data, row, rows + row * kDims, code);
     for (const uint32_t escape : code.escapes) {
       if (count < SPLASH_KVZIP_ESCAPES)
         escapes[count++] = escape;
@@ -113,10 +121,10 @@ inline std::vector<uint16_t> decodeSlab(const ZipPage &page, uint32_t tensor, ui
   std::vector<uint16_t> result(rows * kDims);
   for (uint32_t row = 0; row < rows; ++row)
     for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
-      const uint8_t pair = data[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + dimension / 2];
-      const uint32_t code = dimension & 1 ? pair >> 4 : pair & 0xF;
+      const uint32_t bit = splash_kvzip_code_bit(row, dimension);
+      const uint32_t code = (data[SPLASH_KVZIP_SM_BYTES + bit / 8] >> (bit % 8)) & 0xF;
       const uint32_t exponent = (bases.base4[dimension] + code) & 0xFF;
-      const uint32_t sm = data[row * kDims + dimension];
+      const uint32_t sm = data[splash_kvzip_sm_byte(row, dimension)];
       result[row * kDims + dimension] = uint16_t(((sm & 0x80) << 8) | (exponent << 7) | (sm & 0x7F));
     }
   const uint32_t count = std::min(page.count(tensor, head), SPLASH_KVZIP_ESCAPES);

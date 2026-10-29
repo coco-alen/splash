@@ -74,7 +74,7 @@ inline void splash_kvzip_store_rows(SplashKvZipSlab slab, device const uchar *ba
                                     device atomic_uint *overflow_slabs, uint row_begin,
                                     uint row_end, Source source, threadgroup uint *partial,
                                     uint dimension, uint simd_lane, uint simd_group) {
-  const uint base = bases[dimension];
+  const uint base = bases[splash_kvzip_base_byte(dimension)];
   // The escapes of the committed rows: those before the first entry of a
   // row at row_begin or past it, by a threadgroup minimum over the table.
   uint count = *slab.count;
@@ -101,12 +101,13 @@ inline void splash_kvzip_store_rows(SplashKvZipSlab slab, device const uchar *ba
     const int delta = int(exponent) - int(base);
     const bool escapes = delta < 0 || delta >= 16;
     const uint code = escapes ? 0u : uint(delta);
-    slab.data[row * SPLASH_KVZIP_DIMENSIONS + dimension] = uchar(sm);
-    // Two codes to a byte: the odd dimension's lane holds the pair.
-    const uint pair = code | (simd_shuffle_xor(code, 1) << 4);
-    if (dimension & 1u)
-      slab.data[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + dimension / 2u] =
-          uchar((pair >> 4) | ((pair & 0xFu) << 4));
+    slab.data[splash_kvzip_sm_byte(row, dimension)] = uchar(sm);
+    // Two codes to a byte, of dimensions two apart (splash_kvzip_code_bit):
+    // the lane of the high nibble's writes it.
+    const uint partner = simd_shuffle_xor(code, 2);
+    if (dimension & 2u)
+      slab.data[SPLASH_KVZIP_SM_BYTES + splash_kvzip_code_bit(row, dimension) / 8u] =
+          uchar(partner | (code << 4));
     // This row's escapes, in dimension order, after the rows before it.
     const ulong votes = ulong(static_cast<simd_vote::vote_t>(simd_ballot(escapes)));
     const uint before_in_simd = popcount(uint(votes & ((1ul << simd_lane) - 1ul)));
@@ -144,27 +145,12 @@ inline void splash_kvzip_store_rows(SplashKvZipSlab slab, device const uchar *ba
   }
 }
 
-// One thread's 32 dimensions of a head's window bases, four to a word.
-struct SplashKvZipLaneBases {
-  uint words[8];
-};
-
-inline SplashKvZipLaneBases splash_kvzip_lane_bases(device const uchar *bases, uint thread_index) {
-  device const uint4 *vectors =
-      reinterpret_cast<device const uint4 *>(bases + (thread_index & 7u) * 32u);
-  const uint4 low = vectors[0], high = vectors[1];
-  return {{low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w}};
-}
-
-// Four elements' BF16 bits, as two words of two, from their sign/mantissa
-// bytes and exponent bytes (four to a word each).
-inline uint2 splash_kvzip_pack4(uint sm, uint exponent) {
-  const uint high = (sm & 0x80808080u) | ((exponent >> 1) & 0x7F7F7F7Fu);
-  const uint low = ((exponent & 0x01010101u) << 7) | (sm & 0x7F7F7F7Fu);
-  return uint2((low & 0xFFu) | ((high & 0xFFu) << 8) | ((low & 0xFF00u) << 8) |
-                   ((high & 0xFF00u) << 16),
-               ((low >> 16) & 0xFFu) | (((high >> 16) & 0xFFu) << 8) |
-                   ((low & 0xFF000000u) >> 8) | (high & 0xFF000000u));
+// Two elements' BF16 bits, one in each 16-bit half, from their sign/mantissa
+// bytes, codes and bases in the low byte of each half: adding
+// (sm & 0x80) * 0xFF moves each sign from bit 7 to bit 15, and no half
+// carries into the other (an exponent fits a byte).
+inline uint splash_kvzip_pair(uint sm, uint code, uint base) {
+  return sm + (sm & 0x00800080u) * 0xFFu + ((base + code) << 7);
 }
 
 // A thread's 32 decoded elements, contiguous in a token-major row.
@@ -181,14 +167,17 @@ inline void splash_kvzip_store_row(device ushort *bits, thread const uint *out) 
 
 // One thread's share of a slab, loaded ahead of its decode in one round
 // trip: its row's 32 sign/mantissa bytes and 16 code bytes from dimension
-// 32 (t % 8) of row t / 8, the escape count and the first four escapes.
+// 32 (t % 8) of row t / 8, those 32 dimensions' bases, the escape count and
+// the first four escapes. Loading the bases with each slab, rather than once
+// per tile, keeps them out of the registers the page loop holds.
 struct SplashKvZipLoaded {
-  uint4 sm_low, sm_high, codes, escapes;
+  uint4 sm_low, sm_high, codes, escapes, bases_low, bases_high;
   uint count;
   bool valid;
 };
 
-inline SplashKvZipLoaded splash_kvzip_load(SplashKvZipSlab slab, uint rows, uint thread_index) {
+inline SplashKvZipLoaded splash_kvzip_load(SplashKvZipSlab slab, device const uchar *bases, uint rows,
+                                           uint thread_index) {
   constexpr uint D = SPLASH_KVZIP_DIMENSIONS;
   const uint row = thread_index >> 3;
   const uint first = (thread_index & 7u) * 32u;
@@ -200,6 +189,9 @@ inline SplashKvZipLoaded splash_kvzip_load(SplashKvZipSlab slab, uint rows, uint
     loaded.codes = *reinterpret_cast<device const uint4 *>(
         slab.data + SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + first / 2u);
   }
+  device const uint4 *base_vectors = reinterpret_cast<device const uint4 *>(bases + first);
+  loaded.bases_low = base_vectors[0];
+  loaded.bases_high = base_vectors[1];
   loaded.count = min(*slab.count, SPLASH_KVZIP_ESCAPES);
   loaded.escapes = *reinterpret_cast<device const uint4 *>(slab.escapes);
   return loaded;
@@ -224,7 +216,6 @@ inline void splash_kvzip_patch(uint escape, uint row, uint first, thread uint *o
 // at uniform addresses. Ends with a threadgroup barrier.
 template <typename Bits>
 inline void splash_kvzip_decode_slab(thread const SplashKvZipLoaded &loaded, SplashKvZipSlab slab,
-                                     thread const SplashKvZipLaneBases &bases,
                                      bool dimension_major, Bits bits, uint thread_index) {
   constexpr uint D = SPLASH_KVZIP_DIMENSIONS;
   constexpr uint N = SPLASH_KVZIP_ROWS;
@@ -233,15 +224,18 @@ inline void splash_kvzip_decode_slab(thread const SplashKvZipLoaded &loaded, Spl
   const uint sm_words[8] = {loaded.sm_low.x,  loaded.sm_low.y,  loaded.sm_low.z,  loaded.sm_low.w,
                             loaded.sm_high.x, loaded.sm_high.y, loaded.sm_high.z, loaded.sm_high.w};
   const uint code_words[4] = {loaded.codes.x, loaded.codes.y, loaded.codes.z, loaded.codes.w};
+  const uint base_words[8] = {loaded.bases_low.x,  loaded.bases_low.y,  loaded.bases_low.z,  loaded.bases_low.w,
+                              loaded.bases_high.x, loaded.bases_high.y, loaded.bases_high.z, loaded.bases_high.w};
   uint out[16];
+  // Pair p, dimensions first + 2p and first + 2p + 1: the even or odd bytes
+  // of sign/mantissa and base word p / 2, and bits 4 (p % 4) and 16 + 4 (p % 4)
+  // of code word p / 4.
 #pragma unroll
-  for (uint word = 0; word < 8; ++word) {
-    const uint nibbles = (code_words[word >> 1] >> (16u * (word & 1u))) & 0xFFFFu;
-    const uint code4 = (nibbles & 0xFu) | ((nibbles & 0xF0u) << 4) | ((nibbles & 0xF00u) << 8) |
-                       ((nibbles & 0xF000u) << 12);
-    const uint2 packed = splash_kvzip_pack4(sm_words[word], bases.words[word] + code4);
-    out[2 * word] = packed.x;
-    out[2 * word + 1] = packed.y;
+  for (uint pair = 0; pair < 16; ++pair) {
+    const uint shift = 8u * (pair & 1u);
+    out[pair] = splash_kvzip_pair((sm_words[pair >> 1] >> shift) & 0x00FF00FFu,
+                                  (code_words[pair >> 2] >> (4u * (pair & 3u))) & 0x000F000Fu,
+                                  (base_words[pair >> 1] >> shift) & 0x00FF00FFu);
   }
   const uint head[4] = {loaded.escapes.x, loaded.escapes.y, loaded.escapes.z, loaded.escapes.w};
   for (uint index = 0; index < min(loaded.count, 4u); ++index)
@@ -288,9 +282,8 @@ inline void splash_kvzip_expand_history(device const SplashKvPage *page_table,
       SplashKvAddressing<KVHeads, bfloat>(params.scratch, head).page(scratch_table[page]);
   device ushort *bits =
       reinterpret_cast<device ushort *>(value_tensor ? target.values : target.keys);
-  const SplashKvZipLaneBases bases =
-      splash_kvzip_lane_bases(addressing.bases(codec, head, value_tensor), thread_index);
   const SplashKvZipSlab slab = addressing.slab(entry, head, value_tensor);
-  splash_kvzip_decode_slab(splash_kvzip_load(slab, rows, thread_index), slab, bases, value_tensor,
-                           bits, thread_index);
+  splash_kvzip_decode_slab(
+      splash_kvzip_load(slab, addressing.bases(codec, head, value_tensor), rows, thread_index), slab,
+      value_tensor, bits, thread_index);
 }

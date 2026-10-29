@@ -128,15 +128,14 @@ Boundaries:
   (`PrefillTensor::ZipScratch`) and writes the chunk's rows there as well, one
   bandwidth pass per layer and chunk (27B: 0.9 ms at 32K, 3.8 ms at 128K).
 - Verify decodes each page into a 16 KiB threadgroup tile, token-major, and
-  runs the BF16 loop's MPP products and softmax over it, bit for bit. On the
-  27B's shape the scores have their own scratch, so a page's values decode in
-  its softmax's phase: four barriers a page instead of six.
+  runs the BF16 loop's MPP products and softmax over it, bit for bit.
 - A slab with more escapes than its table stores the rest with code 0 (never
   an infinity or NaN); the store counts it, `/status` reports
   `identity.kv.overflow_slabs` and the server logs an error. Real KV needs 0.8
   escapes per slab on average (at most 26 over 150K captured tokens of both
   models); prompts of one repeated token up to ~200.
-- The persistent cache namespace includes the bases' digest.
+- The persistent cache namespace includes the bases' digest and the page
+  layout's version (`SPLASH_KVZIP_LAYOUT_VERSION`).
 
 Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
 
@@ -147,16 +146,38 @@ Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
 - Greedy HTTP outputs on four prompts (short, story, 30K code, 40K prose):
   identical to `--kv-format bf16` on both models; prefill times within noise
   of BF16's.
-- `attention-sweep --kv-sample` on captured KV, per layer at 128K history,
-  one lane: verify 27B 3.06 ms (BF16 2.71), 35B 1.79 ms (BF16 1.54); at
-  32K 0.85 (0.76) and 0.53 (0.44). With the 27B's values decoding beside its
-  softmax (2026-10-28, 38K captured tokens of code and prose each): 27B 2.87
-  ms at 128K (BF16 2.70) and 11.20 at four lanes (10.34), 0.81 at 32K
-  (0.77), 0.097 at 2K (0.084); the 35B, whose 8 KiB of scores cost its short
-  contexts more than the barrier saves, keeps sharing the tile. The BF16 verify kernel runs within ~25%
-  of its compute floor under 8-row speculative verify, so a decoded page's
-  wait for its own bytes costs more than the 19% fewer bytes save: lossless
-  pages give capacity (23% more context), not a decode speedup, on this GPU.
+- `attention-sweep --kv-sample` on captured KV, per layer, verify. The first
+  version decoded slower than BF16 (27B 3.06 ms at 128K against 2.71, 35B
+  1.79 against 1.54). Two changes (2026-10-28) make the 27B faster than BF16
+  at every context and bring the 35B within 4-7%:
+  - The 27B's scores have their own scratch, so a page's values decode in
+    its softmax's phase: four barriers a page instead of six.
+  - Decoding costs a third less: the page layout orders each word's
+    sign/mantissa bytes and codes so that a word decodes as two BF16 pairs
+    in 32-bit arithmetic (`splash_kvzip_pair`), the codec holds the bases in
+    the same order, and each slab's bases load with its bytes instead of
+    sitting in registers across the page loop (held, the compiler hoisted
+    their pairs and the 35B lost 30% to the registers).
+  Timing probes on the 27B at 128K before the second change: the tile's
+  products and barriers alone 1.44 ms, the slab loads 0.83, the decode
+  arithmetic 0.48. ABBA medians on 38K captured tokens of code and prose
+  per model, M5 Pro 16 (ms; the PR's earlier head in parentheses):
+
+  | Model | History | Lanes | BF16 | ZBF16 |
+  | --- | ---: | ---: | ---: | ---: |
+  | 27B | 2,048 | 1 | 0.086 | 0.079 (0.092) |
+  | 27B | 32,768 | 1 | 0.779 | 0.740 (0.812) |
+  | 27B | 32,768 | 4 | 2.848 | 2.789 (3.003) |
+  | 27B | 131,072 | 1 | 2.730 | 2.683 (2.873) |
+  | 27B | 131,072 | 4 | 10.637 | 10.488 (11.286) |
+  | 35B | 2,048 | 1 | 0.037 | 0.050 (0.061) |
+  | 35B | 32,768 | 1 | 0.464 | 0.492 (0.526) |
+  | 35B | 131,072 | 1 | 1.536 | 1.648 (1.768) |
+  | 35B | 131,072 | 4 | 5.823 | 6.201 (6.625) |
+
+  Outputs are unchanged: every digest equals BF16's and the earlier
+  layout's, and greedy outputs of the 27B (a short prompt, and 34K tokens
+  of code) equal BF16's token for token.
 - INT8 and BF16 unchanged: every attention kernel's bits and times match the
   upstream metallib (36 cases), and the ABBA regression against upstream
   (`test-performance-real` with `BASELINE`, idle, ANE split off on both)

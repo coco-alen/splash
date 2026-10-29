@@ -56,10 +56,8 @@ inline void splash_paged_attention_zip_tile(
   auto k0 = kt.slice<D, N>(0, 0);
   auto v0 = vt.slice<D, N>(0, 0);
   const SplashKvZipAddressing<KVHeads> addressing(kv);
-  const SplashKvZipLaneBases key_bases =
-      splash_kvzip_lane_bases(addressing.bases(codec, kv_head, false), thread_index);
-  const SplashKvZipLaneBases value_bases =
-      splash_kvzip_lane_bases(addressing.bases(codec, kv_head, true), thread_index);
+  device const uchar *key_bases = addressing.bases(codec, kv_head, false);
+  device const uchar *value_bases = addressing.bases(codec, kv_head, true);
   constexpr auto qk_descriptor =
       matmul2d_descriptor(M, N, D, false, true, false,
                           matmul2d_descriptor::mode::multiply);
@@ -86,8 +84,8 @@ inline void splash_paged_attention_zip_tile(
     const uint rows = min(uint(N), visible_tokens - token_start);
     const SplashKvZipSlab keys = addressing.slab(entry, kv_head, false);
     const SplashKvZipSlab values = addressing.slab(entry, kv_head, true);
-    splash_kvzip_decode_slab(splash_kvzip_load(keys, rows, thread_index), keys, key_bases, false,
-                             bits, thread_index);
+    splash_kvzip_decode_slab(splash_kvzip_load(keys, key_bases, rows, thread_index), keys, false, bits,
+                             thread_index);
     auto page_scores = qk.template get_destination_cooperative_tensor<
         decltype(q0), decltype(k0), float>();
     qk.run(q0, k0, page_scores);
@@ -107,8 +105,8 @@ inline void splash_paged_attention_zip_tile(
     // read before the values overwrite them.
     if (!OwnScores)
       threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_kvzip_decode_slab(splash_kvzip_load(values, rows, thread_index), values, value_bases,
-                             false, bits, thread_index);
+    splash_kvzip_decode_slab(splash_kvzip_load(values, value_bases, rows, thread_index), values, false,
+                             bits, thread_index);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
       for (ushort index = 0; index < running.get_capacity(); ++index) {

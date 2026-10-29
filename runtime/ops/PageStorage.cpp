@@ -55,7 +55,11 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     header.layers = layout_.attentionLayers;
     header.kv_heads = layout_.kvHeads;
     std::memcpy(contents, &header, sizeof(header));
-    std::memcpy(contents + SPLASH_KVZIP_HEADER_BYTES, zipBases.data(), zipBases.size());
+    // Each head's base3 and base4 in the codec's order (splash_kvzip_base_byte).
+    auto *bases = reinterpret_cast<uint8_t *>(contents + SPLASH_KVZIP_HEADER_BYTES);
+    for (size_t block = 0; block < zipBases.size(); block += SPLASH_KVZIP_DIMENSIONS)
+        for (uint32_t dimension = 0; dimension < SPLASH_KVZIP_DIMENSIONS; ++dimension)
+            bases[block + splash_kvzip_base_byte(dimension)] = zipBases[block + dimension];
 }
 
 uint32_t PageStorage::zipOverflowSlabs() const noexcept {

@@ -133,8 +133,9 @@ Pool makePool(metal::MetalBackend &backend, kv::Format format, uint32_t kvHeads,
         for (uint32_t head = 0; head < kvHeads; ++head) {
           uint8_t *at = bytes + splash_kvzip_base_offset(kvHeads, layer, tensor, head);
           for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
-            at[dimension] = layer == tested ? bases[tensor][head].base3[dimension] : 1;
-            at[kDims + dimension] = layer == tested ? bases[tensor][head].base4[dimension] : 2;
+            at[splash_kvzip_base_byte(dimension)] = layer == tested ? bases[tensor][head].base3[dimension] : 1;
+            at[kDims + splash_kvzip_base_byte(dimension)] =
+                layer == tested ? bases[tensor][head].base4[dimension] : 2;
           }
         }
   }
@@ -213,15 +214,14 @@ uint32_t requireDecodes(const Pool &pool, const std::vector<uint32_t> &pages, co
         uint32_t stored = 0;
         for (uint32_t row = 0; row < count; ++row) {
           const RowCode code = encodeRow(expected + row * kDims, row, pool.bases[tensor][head]);
-          for (uint32_t pair = 0; pair < kDims / 2; ++pair)
-            require(actualData[SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + pair] ==
-                        uint8_t(code.code[2 * pair] | (code.code[2 * pair + 1] << 4)),
-                    where + ": codes differ from the host store's");
-          for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
-            const uint32_t bits = expected[row * kDims + dimension];
-            require(actualData[row * kDims + dimension] == uint8_t(((bits >> 8) & 0x80) | (bits & 0x7F)),
-                    where + ": sign/mantissa bytes differ from the host store's");
-          }
+          std::vector<uint8_t> host(SPLASH_KVZIP_DATA_BYTES_PER_HEAD);
+          writeRow(host.data(), row, expected + row * kDims, code);
+          const uint32_t codes = SPLASH_KVZIP_SM_BYTES + row * SPLASH_KVZIP_CODE_BYTES_PER_ROW;
+          require(std::equal(host.begin() + codes, host.begin() + codes + SPLASH_KVZIP_CODE_BYTES_PER_ROW,
+                             actualData + codes),
+                  where + ": codes differ from the host store's");
+          require(std::equal(host.begin() + row * kDims, host.begin() + (row + 1) * kDims, actualData + row * kDims),
+                  where + ": sign/mantissa bytes differ from the host store's");
           for (const uint32_t escape : code.escapes) {
             require(stored < SPLASH_KVZIP_ESCAPES && actualEscapes[stored] == escape,
                     where + ": escape " + std::to_string(stored) + " differs from the host store's");

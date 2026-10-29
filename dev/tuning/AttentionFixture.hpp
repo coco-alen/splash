@@ -394,8 +394,10 @@ public:
       for (uint32_t head = 0; head < heads; ++head) {
         bases.push_back(windows(histograms[tensor * heads + head]));
         uint8_t *at = codec + splash_kvzip_base_offset(heads, plan_.geometry.layer, tensor, head);
-        std::memcpy(at, bases.back().base3.data(), kDims);
-        std::memcpy(at + kDims, bases.back().base4.data(), kDims);
+        for (uint32_t dimension = 0; dimension < kDims; ++dimension) {
+          at[splash_kvzip_base_byte(dimension)] = bases.back().base3[dimension];
+          at[kDims + splash_kvzip_base_byte(dimension)] = bases.back().base4[dimension];
+        }
       }
     std::vector<uint16_t> rows(kRows * kDims);
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane)

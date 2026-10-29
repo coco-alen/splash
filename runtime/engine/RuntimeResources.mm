@@ -230,7 +230,8 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
             << SPLASH_DRAFT_SLIDING_WINDOW << '\n';
   if (!kvZipBases.empty())
-    canonical << "kv bases " << model::weightDigest(kvZipBases) << '\n';
+    canonical << "kv bases " << model::weightDigest(kvZipBases) << " layout " << SPLASH_KVZIP_LAYOUT_VERSION
+              << '\n';
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, 32);
 }

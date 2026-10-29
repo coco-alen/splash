@@ -12,11 +12,17 @@
 // BF16 tile layout they consume.
 //
 // Per (page, layer, tensor, KV head) slab of 32 tokens x 256 dimensions:
-//   data: sm[32][256]      sign << 7 | 7 mantissa bits, one byte per element
-//         codes[32][128]   one 4-bit code per element, element d of a row in
-//                          byte d / 2, the even element in the low nibble:
+//   data: sm[32][256]      sign << 7 | 7 mantissa bits, one byte per element,
+//                          dimensions 4k..4k+3 of a row in the order 4k,
+//                          4k + 2, 4k + 1, 4k + 3 (splash_kvzip_sm_byte)
+//         codes[32][128]   one 4-bit code per element, dimensions 8k..8k+7
+//                          of a row in one little-endian word, dimension
+//                          8k + 2q + e at bit 16e + 4q (splash_kvzip_code_bit):
 //                          exponent = base[dimension] + code, for the
 //                          elements whose exponent lies in the window
+//         The orders let a word decode as two BF16 pairs with 32-bit
+//         arithmetic, each pair's two elements in its 16-bit halves
+//         (kernels/common/kv_zip.h).
 //   aux:  count            uint32: the slab's escapes, then 12 bytes unused
 //         escapes[252]     the elements whose exponent lies outside the
 //                          window, in row order: uint16 position
@@ -40,6 +46,9 @@
 
 #include "metal/abi/PagedAttention.h"
 
+// The page layout's version, which the persistent cache's namespace names.
+#define SPLASH_KVZIP_LAYOUT_VERSION 2u
+
 #define SPLASH_KVZIP_ROWS 32u
 #define SPLASH_KVZIP_DIMENSIONS 256u
 #define SPLASH_KVZIP_CODE_BYTES_PER_ROW (SPLASH_KVZIP_DIMENSIONS / 2u)
@@ -55,7 +64,9 @@
   (SPLASH_KVZIP_ESCAPE_HEADER_BYTES + SPLASH_KVZIP_ESCAPES * SPLASH_KVZIP_ESCAPE_BYTES)
 
 // The codec buffer: a header, then per attention layer and tensor (keys,
-// values) and KV head, base3[256] and base4[256]; ZBF16 uses base4.
+// values) and KV head, base3[256] and base4[256], each in the order of the
+// sign/mantissa bytes (splash_kvzip_base_byte), so that a word of bases
+// lines up with a word of those bytes; ZBF16 uses base4.
 struct SplashKvZipHeader {
   // Slabs that stored escapes past the table, counted by the store kernels.
   uint32_t overflow_slabs;
@@ -98,3 +109,24 @@ struct SplashKvZipExpandParams {
 static_assert(sizeof(SplashKvZipExpandParams) == 32,
               "ZBF16 expand parameters are 32 bytes on both sides");
 #endif
+
+// The byte of a slab's sign/mantissa bytes that holds element (row,
+// dimension).
+inline uint32_t splash_kvzip_sm_byte(uint32_t row, uint32_t dimension) {
+  const uint32_t lane = dimension & 3u;
+  return row * SPLASH_KVZIP_DIMENSIONS + (dimension & ~3u) + (((lane & 1u) << 1) | (lane >> 1));
+}
+
+// The bit of a slab's codes, from the codes' first byte, where element (row,
+// dimension)'s 4-bit code begins.
+inline uint32_t splash_kvzip_code_bit(uint32_t row, uint32_t dimension) {
+  return (row * SPLASH_KVZIP_CODE_BYTES_PER_ROW + (dimension >> 3) * 4u) * 8u + 16u * (dimension & 1u) +
+         4u * ((dimension & 7u) >> 1);
+}
+
+// The byte of a head's 256 bases (base3 or base4) in the codec buffer that
+// holds a dimension's base: the sign/mantissa bytes' order.
+inline uint32_t splash_kvzip_base_byte(uint32_t dimension) {
+  return splash_kvzip_sm_byte(0u, dimension);
+}
+
