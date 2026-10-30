@@ -279,6 +279,10 @@ std::string compare(const std::vector<uint16_t> &left, const std::vector<uint16_
 
 // ---------------------------------------------------------------------------
 
+// The most rows a ZBF16 prefill attends without expanding its history:
+// PagedAttention.cpp's kZipDirectTiles tiles.
+constexpr uint32_t kZipDirectRows = 32;
+
 // Prefill store + attention of `rows` rows after `history` committed tokens,
 // in BF16 and in ZBF16 over the same values. The two outputs must be equal.
 void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t history, uint32_t rows,
@@ -318,10 +322,14 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t queryHeads, uint32_t hi
     require(graph.dispatches().size() == 1, "a prefill store should encode one dispatch");
     ops::PagedAttention::addPrefill(graph, pool.layer, queries, output, partials, statistics, table, chunk, plan,
                                     {}, {}, zip);
-    require(graph.dispatches().size() == (format == kv::Format::ZipBFloat16 ? 4U : 3U),
-            "ZBF16 prefill should expand what it attends, then split and reduce");
-    require(std::string(plan.splitPipeline).find("bf16_split") != std::string::npos,
-            "prefill should attend through the BF16 split");
+    require(graph.dispatches().size() == (plan.zipExpand ? 4U : 3U),
+            "a long ZBF16 prefill should expand what it attends, then split and reduce");
+    require(plan.zipExpand == (format == kv::Format::ZipBFloat16 && rows > kZipDirectRows),
+            "ZBF16 prefill should expand its history past " + std::to_string(kZipDirectRows) + " rows");
+    require(std::string(plan.splitPipeline).find(plan.zipExpand || format == kv::Format::BFloat16 ? "bf16_split"
+                                                                                                 : "zip_split") !=
+                std::string::npos,
+            "prefill should attend through the BF16 split, or a short ZBF16 one through its own");
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     if (format == kv::Format::ZipBFloat16) {
       escapes = requireDecodes(pool, pages, values, tokens, "prefill store");
@@ -531,10 +539,13 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     checkEscapeOverflow(backend);
     for (const uint32_t heads : {24U, 16U}) {
-      for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 6>{
-               {{0, 1}, {0, 64}, {13, 50}, {100, 77}, {1023, 257}, {4093, 1057}}})
+      // Up to kZipDirectRows rows the split decodes the pages; past them the
+      // history expands.
+      for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 9>{
+               {{0, 1}, {29, 32}, {4093, 13}, {100, 33}, {0, 64}, {13, 50}, {100, 77}, {1023, 257}, {4093, 1057}}})
         checkPrefill(backend, heads, history, rows);
       checkPrefill(backend, heads, 45, 300, true);
+      checkPrefill(backend, heads, 45, 20, true);
       checkVerify(backend, heads, {0, 29, 31, 1000}, 4);
       checkVerify(backend, heads, {4090, 0, 0, 0}, 1);
       // Past kZipOwnScoresHistory the 35B's split shares its tile with the scores.

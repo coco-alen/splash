@@ -15,6 +15,7 @@
 // usage: attention-sweep METALLIB [--histories 0,2048,...]
 //                        [--shapes 27b,35b,122b,fn,flint-window,flint-full]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
+//                        [--prefill-rows N]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16|zbf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
 //                        [--located] [--kv-sample SHAPE=PATH[,SHAPE=PATH]]
@@ -198,9 +199,9 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
   return bits;
 }
 
-// The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
-// after `history` tokens, with their plan's scratch.
-AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
+// A prefill chunk of `prefillRows` rows on one lane, or the verify rows of
+// `lanes` lanes, all after `history` tokens, with their plan's scratch.
+AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t prefillRows, uint32_t lanes,
                               uint32_t history, uint32_t extentPages) {
   const kv::Layout layout{.attentionLayers = 1, .kvHeads = shape.kvHeads, .headDimension = shape.headDimension,
                           .format = shape.format, .valuesTokenMajor = shape.valuesTokenMajor};
@@ -208,12 +209,12 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
   const AttentionWorkspace scratch =
-      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout, shape.variant)
+      prefill ? PagedAttention::prefillPlan(prefillRows, shape.queryHeads, layout, shape.variant)
                     .workspace
               : PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout,
                                            std::span(histories).first(caseLanes), shape.variant)
                     .workspace;
-  return AttentionFixturePlan::make(shape, caseLanes, prefill ? kPrefillRows : kVerifyRows,
+  return AttentionFixturePlan::make(shape, caseLanes, prefill ? prefillRows : kVerifyRows,
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
 
@@ -591,7 +592,7 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] "
                    "[--shapes 27b,35b,122b,fn,flint-window,flint-full] "
-                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
+                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] [--prefill-rows N] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16|zbf16] [--kv-sample SHAPE=PATH,...] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
                    "[--located]\n";
@@ -601,6 +602,7 @@ int main(int argc, const char *argv[]) {
     std::vector<uint32_t> lanes{1, 4};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
+    uint32_t prefillRows = kPrefillRows;
     // Zero: the largest extent the memory plan picks for the model's K/V
     // pages (Flash-Next's without its index regions, which no case reads).
     uint32_t extentPages = 0;
@@ -621,6 +623,8 @@ int main(int argc, const char *argv[]) {
         histories = parseList(value, 0, kv::kMaximumPhysicalTokens - kPrefillRows, option);
       else if (option == "--lanes")
         lanes = parseList(value, 1, kMaximumLanes, option);
+      else if (option == "--prefill-rows")
+        prefillRows = parseCount(value, 1, kPrefillRows, option);
       else if (option == "--repeat")
         repeat = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--extent-pages")
@@ -716,7 +720,7 @@ int main(int argc, const char *argv[]) {
           // Only a verify with lists reads its blocks through locations.
           const bool caseLocated = located && !prefill && !shapeQsa.empty();
           const auto cases =
-              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages),
+              measure(backends, casePlan(geometry, prefill, prefillRows, lane, history, shapeExtentPages),
                       prefill, repeat, warmupSeconds, shapeQsa, caseLocated, sample.get());
           warmupSeconds = 0.1;
           for (size_t i = 0; i < cases.size(); ++i) {

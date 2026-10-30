@@ -128,6 +128,14 @@ std::string prefillSplitFormat(kv::Layout layout) {
   return layout.format == kv::Format::ZipBFloat16 ? "bf16" : kernelFormat(layout);
 }
 
+// The most query tiles a ZBF16 prefill's split decodes its pages for, each
+// tile decoding every page it reads; a longer chunk expands its history into
+// the BF16 scratch once and attends that. At four tiles (32 rows) decoding
+// is 9-24% faster than expanding from 8K tokens of history on both models
+// (the 35B's 5% slower at 2K); at eight, up to 15% slower on the 35B at
+// 2K-8K and 2% on the 27B at 64K (M5 Pro, captured KV).
+constexpr uint32_t kZipDirectTiles = 4;
+
 // The longest lane history the 35B's ZBF16 verify takes its split with own
 // page scores at (kernels/common/paged_attention_zip_tile.h); past it the
 // scores share the decoded tile. Both compute the same bits.
@@ -301,14 +309,17 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const uint32_t splits = prefillSplits(tiles, variant.windowTokens);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const bool zipExpand = layout.format == kv::Format::ZipBFloat16 && tiles > kZipDirectTiles;
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
-          kernelName("prefill", prefillSplitFormat(layout) + (kernel.valuesTokenMajor ? "_sparse" : "_split"),
+          kernelName("prefill",
+                     (zipExpand ? prefillSplitFormat(layout) : kernelFormat(layout)) +
+                         (kernel.valuesTokenMajor ? "_sparse" : "_split"),
                      splitSuffix(kernel, variant)),
           reduceKernel("prefill", kernel, variant),
           {layout.kvHeads * tileParts(queryHeads, layout), tiles, splits},
-          {layout.kvHeads, fusedRows, tiles}, layout.valuesTokenMajor, kernel.sinks,
+          {layout.kvHeads, fusedRows, tiles}, layout.valuesTokenMajor, kernel.sinks, zipExpand,
           layout, queryHeads};
 }
 
@@ -553,10 +564,11 @@ void PagedAttention::addPrefill(
   requireBlocks(blocks, plan.sparse, plan.tiles);
   if (blocks.locations) throw std::invalid_argument("prefill attention takes no block locations");
   requireSinks(sinks, plan.sinks, plan.queryHeads);
-  // ZBF16 attends through the BF16 split and reduce: the history it reads
-  // here, the chunk's rows included, expands into the BF16 scratch first.
-  const bool zipped = plan.layout.format == kv::Format::ZipBFloat16;
-  if (zipped) {
+  // A long ZBF16 chunk attends through the BF16 split and reduce: the history
+  // it reads here, the chunk's rows included, expands into the BF16 scratch
+  // first.
+  const bool expands = plan.zipExpand;
+  if (expands) {
     kv::ChunkedPrefillParams expand = chunk;
     expand.kv = layer;
     const uint32_t visiblePages = kv::chunkedPrefillRequiredPages(chunk);
@@ -566,10 +578,11 @@ void PagedAttention::addPrefill(
   }
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, zipped ? zipScratchLayer(plan.layout) : layer, plan.splits, blocks.stride,
+      chunk.page_table_entries, expands ? zipScratchLayer(plan.layout) : layer, plan.splits, blocks.stride,
       blocks.list};
   std::vector<metal::MetalBuffer> split{std::move(queries), partials, statistics,
-                                        zipped ? zip.scratchTable : std::move(pageTable)};
+                                        expands ? zip.scratchTable : std::move(pageTable)};
+  if (plan.layout.format == kv::Format::ZipBFloat16 && !expands) split.push_back(zip.codec);
   std::vector<metal::MetalBuffer> reduce{partials, statistics, std::move(output)};
   if (plan.sparse) {
     const auto [lists, counts] = blockBindings(blocks, partials);

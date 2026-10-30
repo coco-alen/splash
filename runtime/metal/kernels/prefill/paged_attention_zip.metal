@@ -1,8 +1,9 @@
 #include "metal/kernels/common/paged_attention_zip_tile.h"
 
-// ZBF16 (abi/KvZip.h) prefill store and history expansion.
-// Prefill attends through the BF16 split and reduce, over the BF16 scratch
-// the expansion fills.
+// ZBF16 (abi/KvZip.h) prefill store, history expansion and split. A long
+// chunk attends through the BF16 split and reduce, over the BF16 scratch the
+// expansion fills; a short one's split decodes the pages itself, through the
+// BF16 reduce.
 
 // Store: one threadgroup per (tensor, KV head, page the chunk touches)
 // encodes that page's chunk rows in order.
@@ -48,3 +49,45 @@ PAGED_PREFILL_ZIP_STORE(prefill_attention_zip_store_kv2_g8, 2)
 PAGED_PREFILL_ZIP_EXPAND(prefill_attention_zip_expand, 4)
 PAGED_PREFILL_ZIP_EXPAND(prefill_attention_zip_expand_kv2_g8, 2)
 #undef PAGED_PREFILL_ZIP_EXPAND
+
+// Split: the BF16 prefill split's grid and slots over decoded pages, each
+// tile decoding every page it reads.
+#define PAGED_PREFILL_ZIP_SPLIT(Name, Heads, Group, OwnScores)                 \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table [[buffer(3)]],                     \
+      device const uchar *codec [[buffer(4)]],                                 \
+      constant SplashPrefillAttentionParams &params [[buffer(5)]],             \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint thread_index [[thread_index_in_threadgroup]]) {                     \
+    constexpr uint M = Group * SPLASH_PREFILL_ATTENTION_TILE_ROWS;             \
+    constexpr uint N = SplashKvPageTokens;                                     \
+    constexpr uint D = SPLASH_KVZIP_DIMENSIONS;                                  \
+    static_assert(SPLASH_ATTENTION_TILE_PARTS(Group) == 1, "one part a tile");  \
+    static_assert(OwnScores || M * N * sizeof(float) <= N * D * sizeof(bfloat), \
+                  "shared scores fit the decoded tile");                       \
+    alignas(16) threadgroup float scores[OwnScores ? M * N : 1];               \
+    alignas(16) threadgroup bfloat probabilities[M * N];                       \
+    alignas(16) threadgroup bfloat kv_tile[N * D];                             \
+    threadgroup float row_max[M];                                              \
+    threadgroup float row_sum[M];                                              \
+    threadgroup float previous_scale[M];                                       \
+    threadgroup atomic_uint rescale;                                           \
+    const uint kv_head = group.x, split = group.z;                             \
+    const SplashAttentionTile tile =                                           \
+        splash_prefill_attention_tile<Heads, Group, D>(params, kv_head, group.y); \
+    if (!tile.active || split >= tile.splits)                                  \
+      return;                                                                  \
+    splash_paged_attention_zip_tile<Heads, Group,                              \
+                                    SPLASH_PREFILL_ATTENTION_TILE_ROWS,        \
+                                    OwnScores>(                                \
+        queries + tile.offset, page_table, params.kv, codec, kv_head,          \
+        tile.first_position, tile.active_rows, tile.splits, split, partials,   \
+        statistics, tile.first_slot + split, scores, probabilities, row_max,   \
+        row_sum, previous_scale, &rescale, kv_tile, thread_index);             \
+  }
+PAGED_PREFILL_ZIP_SPLIT(prefill_attention_zip_split, 4, 6, true)
+PAGED_PREFILL_ZIP_SPLIT(prefill_attention_zip_split_kv2_g8, 2, 8, false)
+#undef PAGED_PREFILL_ZIP_SPLIT

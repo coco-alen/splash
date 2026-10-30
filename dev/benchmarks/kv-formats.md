@@ -125,14 +125,17 @@ Boundaries:
   `PageStorage` owns the codec buffer (a header with the escape-overflow count,
   then the bases of `runtime/model/kvzip/<family>.inc`), which the store and
   attention kernels bind after their page tables.
-- Prefill runs the BF16 split and reduce: before them, `addPrefill` expands the
-  history the chunk attends, its own rows (which the store just encoded)
-  included, into a one-layer BF16 scratch of the prefill arena
-  (`PrefillTensor::ZipScratch`), from the view it attends, so pages staged back
-  from the SSD tier expand as the pool's do; one bandwidth pass per layer and
-  chunk (27B: 0.9 ms at 32K, 3.8 ms at 128K). The scratch's table names its
-  pages by address, so the arena is allocated `BufferReach::Addressed` when it
-  holds one.
+- A chunk of more than 32 rows runs the BF16 split and reduce: before them,
+  `addPrefill` expands the history the chunk attends, its own rows (which the
+  store just encoded) included, into a one-layer BF16 scratch of the prefill
+  arena (`PrefillTensor::ZipScratch`), from the view it attends, so pages
+  staged back from the SSD tier expand as the pool's do; one bandwidth pass
+  per layer and chunk (27B: 0.9 ms at 32K, 3.8 ms at 128K). The scratch's
+  table names its pages by address, so the arena is allocated
+  `BufferReach::Addressed` when it holds one. A chunk of up to 32 rows (four
+  query tiles) skips the expansion: its split decodes each page into a
+  threadgroup tile as verify's does, and the BF16 reduce follows
+  (`PrefillAttentionPlan::zipExpand`).
 - Only dense layers of 256 dimensions take ZBF16 (`kv::Layout::valid`): no
   block index, no window and the dense loop's value order, the 27B's and the
   35B's geometries.
@@ -216,12 +219,16 @@ Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
   a pipelined loop over two 8 KiB half tiles that decodes each half beside
   a product (+26-30%: half-width MPP products cost more than the barriers
   they hide); and loading a page's values with its keys (within 3%: the
-  registers cost the occupancy the early loads save). End to end the gap
-  does not show: `backend-benchmark --scenario decode,context --max-context
-  65536` on the 35B decodes 64 tokens in 267 ms of GPU time (BF16 271) and
-  answers after 2K, 10K and 50K tokens of context in 426, 457 and 469 ms
-  (BF16 442, 458, 472), with the same output tokens; prefill and cached
-  continuations within noise.
+  registers cost the occupancy the early loads save). End to end decode
+  does not show the gap: `backend-benchmark --scenario decode,context
+  --max-context 65536` on the 35B (ABBA, two samples a run, 2026-10-30)
+  decodes 64 tokens a lane in 232, 257, 334 and 356 ms of GPU time at one
+  to four lanes (BF16 233, 256, 333, 355), with the same output tokens, and
+  cold prefills of 2K-50K tokens are within 0.4%. Short resumes over long
+  histories were not: an answer's first token after 10K and 50K cached
+  tokens, 16 new rows, took 39.0 and 53.4 ms (BF16 37.6 and 46.9). Each
+  layer expanded the whole history for 16 rows; below, short chunks decode
+  their pages instead.
 - The 35B's verify now picks its split per step: scores apart from the tile
   while every lane's history is at most 16K tokens, shared past it. Both
   splits compute the same bits. ABBA against the shared split alone
@@ -254,6 +261,32 @@ Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
   - Tile stores rotated across banks are 0-3% slower.
   - The verify store encoding eight rows a barrier round ties. Its 7 us
     at 2K (BF16 3 us) is latency, not barriers.
+- Prefill chunks of up to 32 rows (four query tiles) decode their pages in
+  the split, as verify does, instead of expanding the history into the BF16
+  scratch: a resume's few rows paid a bandwidth pass over the whole history
+  in every layer. Both paths compute the same bits; `kv-zip` checks each
+  side of the threshold. Per layer, captured KV, ABBA (fused ms; expanded in
+  parentheses):
+
+  | Model | History | Rows | BF16 | ZBF16 |
+  | --- | ---: | ---: | ---: | ---: |
+  | 27B | 8,192 | 16 | 0.340 | 0.350 (0.559) |
+  | 27B | 32,768 | 16 | 1.137 | 1.216 (2.002) |
+  | 27B | 65,536 | 16 | 2.172 | 2.414 (3.910) |
+  | 27B | 65,536 | 32 | 3.995 | 4.703 (5.749) |
+  | 35B | 8,192 | 16 | 0.223 | 0.258 (0.331) |
+  | 35B | 32,768 | 16 | 0.794 | 0.874 (1.239) |
+  | 35B | 65,536 | 16 | 1.543 | 1.684 (2.423) |
+  | 35B | 65,536 | 32 | 2.919 | 3.256 (3.752) |
+
+  Eight tiles lose to the expansion at short histories (35B, 64 rows at 2K:
+  0.264 against 0.230). The 35B's split shares its tile with the scores at
+  every history: own scores are 1-3% slower here, where a short chunk's
+  grid leaves the cores room. End to end (the same `backend-benchmark`, two
+  ABBA rounds), an answer after 50K cached tokens reaches its first token
+  in 49.0 ms (BF16 47.2; 53.4 before) and after 10K in 38.4 (BF16 38.5);
+  decode, cold prefills and output tokens are unchanged. Longer chunks
+  still expand: a 176-row continuation after 50K is 2% slower than BF16.
 - INT8 and BF16 unchanged: every attention kernel's bits and times match the
   upstream metallib (36 cases), and the ABBA regression against upstream
   (`test-performance-real` with `BASELINE`, idle, ANE split off on both)

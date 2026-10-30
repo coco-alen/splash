@@ -147,17 +147,21 @@ struct PrefillAttentionPlan final {
   // Whether the reduce adds the layer's learned sinks, which addPrefill then
   // takes: its geometry's (kCompiledAttention).
   const bool sinks;
+  // Whether ZBF16 history expands into the BF16 scratch (KvZipPrefill)
+  // before the split; a short chunk's split decodes its pages itself.
+  const bool zipExpand;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       bool sparse, bool sinks, kv::Layout layout, uint32_t queryHeads)
+                       bool sparse, bool sinks, bool zipExpand, kv::Layout layout, uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), rows(rows), tiles(kv::prefillAttentionTiles(rows)),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
-        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks) {}
+        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks),
+        zipExpand(zipExpand) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -248,10 +252,11 @@ struct PagedVerifyBuffers final {
 };
 
 // What ZBF16 prefill needs beside the BF16 path's buffers; empty for other
-// formats. Prefill attends ZBF16 history through the BF16 kernels: before
-// the split it expands the history it attends, the chunk's rows included,
-// into the scratch, a BF16 extent of one layer whose pages scratchTable
-// names in logical order (kv::zipScratchPages()).
+// formats. A long chunk attends ZBF16 history through the BF16 kernels:
+// before the split it expands the history it attends, the chunk's rows
+// included, into the scratch, a BF16 extent of one layer whose pages
+// scratchTable names in logical order (kv::zipScratchPages()). A short one
+// reads the codec alone (PrefillAttentionPlan::zipExpand).
 struct KvZipPrefill final {
   metal::MetalBuffer codec{};
   metal::MetalBuffer scratch{};
