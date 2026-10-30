@@ -90,5 +90,8 @@ PAGED_VERIFY_ZIP_STORE(verify_attention_zip_store_kv2_g8, 2)
         &rescale, kv_tile, thread_index);                                      \
   }
 PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split, 4, 6, true)
+// The 35B's: up to kZipOwnScoresHistory tokens (PagedAttention.cpp) the
+// scores have their own scratch, past it they share the tile.
+PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split_kv2_g8_short, 2, 8, true)
 PAGED_VERIFY_ZIP_SPLIT(verify_attention_zip_split_kv2_g8, 2, 8, false)
 #undef PAGED_VERIFY_ZIP_SPLIT

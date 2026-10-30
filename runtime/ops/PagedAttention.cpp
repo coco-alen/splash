@@ -128,6 +128,19 @@ std::string prefillSplitFormat(kv::Layout layout) {
   return layout.format == kv::Format::ZipBFloat16 ? "bf16" : kernelFormat(layout);
 }
 
+// The longest lane history the 35B's ZBF16 verify takes its split with own
+// page scores at (kernels/common/paged_attention_zip_tile.h); past it the
+// scores share the decoded tile. Both compute the same bits.
+constexpr uint32_t kZipOwnScoresHistory = 16384;
+
+// A verify split's kernel suffix past its geometry's and window's.
+std::string_view verifySplitSuffix(const CompiledAttention &compiled, kv::Layout layout,
+                                   std::span<const uint32_t> historyTokens) {
+  if (layout.format != kv::Format::ZipBFloat16 || compiled.queryHeads != 8 * compiled.kvHeads)
+    return "";
+  return std::ranges::max(historyTokens) <= kZipOwnScoresHistory ? "_short" : "";
+}
+
 // ZBF16 kernels bind the codec before their parameters.
 void requireCodec(kv::Layout layout, const metal::MetalBuffer &codec) {
   if (layout.format == kv::Format::ZipBFloat16 && !codec)
@@ -320,7 +333,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
           kernelName("verify", kernelFormat(layout) + (kernel.valuesTokenMajor ? "_sparse" : "_split"),
-                     splitSuffix(kernel, variant)),
+                     splitSuffix(kernel, variant) + std::string(verifySplitSuffix(kernel, layout, historyTokens))),
           reduceKernel("verify", kernel, variant),
           // A sparse lane's list fills only the first of the plan's splits.
           // Its split grid is one-dimensional, x the KV head and then the

@@ -537,6 +537,8 @@ int main(int argc, char **argv) {
       checkPrefill(backend, heads, 45, 300, true);
       checkVerify(backend, heads, {0, 29, 31, 1000}, 4);
       checkVerify(backend, heads, {4090, 0, 0, 0}, 1);
+      // Past kZipOwnScoresHistory the 35B's split shares its tile with the scores.
+      checkVerify(backend, heads, {16390, 7, 0, 0}, 2);
     }
     std::cout << "kv zip: PASS\n";
   } catch (const std::exception &error) {

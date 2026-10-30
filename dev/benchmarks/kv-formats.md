@@ -222,6 +222,38 @@ Validation on M5 Pro (16 cores, 48 GB), both models, GGUF UD-Q4_K_M:
   answers after 2K, 10K and 50K tokens of context in 426, 457 and 469 ms
   (BF16 442, 458, 472), with the same output tokens; prefill and cached
   continuations within noise.
+- The 35B's verify now picks its split per step: scores apart from the tile
+  while every lane's history is at most 16K tokens, shared past it. Both
+  splits compute the same bits. ABBA against the shared split alone
+  (captured KV, split ms): four lanes 0.131 against 0.144 at 2K, 0.235
+  against 0.256 at 4K and 0.428 against 0.452 at 8K, a tie at 16K, and
+  1% slower at 32K. With one lane the two are within 3% up to 16K. Against
+  BF16 (ms, fused):
+
+  | History | Lanes | BF16 | ZBF16 |
+  | ---: | ---: | ---: | ---: |
+  | 2,048 | 1 | 0.038 | 0.059 |
+  | 2,048 | 4 | 0.190 | 0.176 |
+  | 8,192 | 1 | 0.126 | 0.138 |
+  | 8,192 | 4 | 0.506 | 0.500 |
+  | 16,384 | 4 | 0.858 | 0.910 |
+  | 32,768 | 4 | 1.617 | 1.686 |
+  | 131,072 | 4 | 5.708 | 6.198 |
+
+  The other probes of the long-context gap lost or tied, which places it
+  in the per-page decode phases at three threadgroups a core:
+  - Threadgroup memory sits at the edge of the third threadgroup. The
+    split uses 21,264 bytes; 2 KiB more cost 11% at 32K-128K and 8 KiB
+    more cost 15-20%.
+  - A fourth threadgroup does not pay. A 16 KiB layout (probabilities and
+    statistics in the tile), alone or with a lower-register decode, ties.
+  - Neither does a lower register peak: a decode in two 16-dimension
+    passes ties.
+  - Issuing loads earlier costs registers. Values loaded beside the
+    softmax are 10% slower; values loaded with the keys tie.
+  - Tile stores rotated across banks are 0-3% slower.
+  - The verify store encoding eight rows a barrier round ties. Its 7 us
+    at 2K (BF16 3 us) is latency, not barriers.
 - INT8 and BF16 unchanged: every attention kernel's bits and times match the
   upstream metallib (36 cases), and the ABBA regression against upstream
   (`test-performance-real` with `BASELINE`, idle, ANE split off on both)

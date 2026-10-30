@@ -14,11 +14,14 @@
 // its softmax, which touches neither: a page takes four barriers, after its
 // keys' decode, before its softmax, after its values' decode and after its
 // products. Without it the scores share the tile, written after the keys'
-// last read and read before the values' first write, at two barriers more:
-// 6% faster on the 27B's six query heads per KV head (M5 Pro, 2K-128K),
-// within 1% on the 35B's eight, whose 8 KiB of scores cost the short
-// contexts more. Threadgroup scratch beyond the BF16 loop's probabilities
-// and statistics: the 16 KiB tile, and the scores with OwnScores.
+// last read and read before the values' first write, at two barriers more.
+// Own scores are 6% faster on the 27B's six query heads per KV head (M5 Pro,
+// 2K-128K). On the 35B's eight they are 5-9% faster with four lanes up to
+// 16K tokens of history, and 1-6% slower past it, where their 8 KiB leave two
+// threadgroups a core instead of three; its verify picks per step
+// (PagedAttention::verifyPlan). Threadgroup scratch beyond the BF16 loop's
+// probabilities and statistics: the 16 KiB tile, and the scores with
+// OwnScores.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, bool OwnScores>
 inline void splash_paged_attention_zip_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
