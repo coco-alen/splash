@@ -245,4 +245,3 @@ width per dimension with escapes (27B K 0.953, V 0.983; 35B K 0.934, V
 0.956). ZBF16's verify spends about 6% over BF16 on decoding through
 threadgroup memory, which INT8's MPP products, reading device memory
 directly, do not pay; at most 7% fewer bytes cannot buy that back.
-

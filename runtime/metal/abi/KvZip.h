@@ -129,4 +129,3 @@ inline uint32_t splash_kvzip_code_bit(uint32_t row, uint32_t dimension) {
 inline uint32_t splash_kvzip_base_byte(uint32_t dimension) {
   return splash_kvzip_sm_byte(0u, dimension);
 }
-
